@@ -1,0 +1,20 @@
+# Development files
+examples/
+test/
+.editorconfig
+jsconfig.json
+.gitignore
+*.enc
+*.tmp.*
+
+# CI / tooling
+.github/
+*.log
+
+# Sensitive files — never publish
+session.json
+appstate.json
+backup.enc
+credentials.enc
+cache.enc
+tokens.enc
