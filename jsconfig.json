@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "checkJs": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "strictNullChecks": true,
+    "baseUrl": ".",
+    "paths": {
+      "kaisha": ["src/index.js"],
+      "kaisha/secure": ["src/secure.js"],
+      "kaisha/health": ["src/health.js"],
+      "kaisha/logger": ["src/logger.js"],
+      "kaisha/session": ["src/session.js"],
+      "kaisha/cache": ["src/cache.js"],
+      "kaisha/request": ["src/request.js"],
+      "kaisha/retry": ["src/retry.js"]
+    },
+    "lib": ["ES2022"],
+    "types": []
+  },
+  "include": ["src/**/*.js", "examples/**/*.js", "types/**/*.d.ts"],
+  "exclude": ["node_modules"]
+}

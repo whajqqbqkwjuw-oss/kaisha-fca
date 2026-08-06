@@ -1,0 +1,90 @@
+{
+  "name": "kaisha",
+  "version": "1.2.0",
+  "description": "A production-ready Facebook Messenger library for Node.js with real-time MQTT events, encrypted session storage, connection health monitoring, and a composable plugin system.",
+  "main": "src/index.js",
+  "types": "types/index.d.ts",
+  "exports": {
+    ".": {
+      "require": "./src/index.js",
+      "types": "./types/index.d.ts"
+    },
+    "./secure": {
+      "require": "./src/secure.js",
+      "types": "./types/index.d.ts"
+    },
+    "./health": {
+      "require": "./src/health.js",
+      "types": "./types/index.d.ts"
+    },
+    "./logger": {
+      "require": "./src/logger.js",
+      "types": "./types/index.d.ts"
+    },
+    "./session": {
+      "require": "./src/session.js",
+      "types": "./types/index.d.ts"
+    },
+    "./cache": {
+      "require": "./src/cache.js",
+      "types": "./types/index.d.ts"
+    },
+    "./retry": {
+      "require": "./src/retry.js",
+      "types": "./types/index.d.ts"
+    },
+    "./request": {
+      "require": "./src/request.js",
+      "types": "./types/index.d.ts"
+    }
+  },
+  "scripts": {
+    "verify": "node -e \"const k=require('.');console.log('Exports OK:',Object.keys(k).sort().join(', '));\"",
+    "lint": "node --check src/*.js"
+  },
+  "keywords": [
+    "facebook",
+    "messenger",
+    "chatbot",
+    "bot",
+    "mqtt",
+    "websocket",
+    "real-time",
+    "events",
+    "automation",
+    "messaging",
+    "encrypted",
+    "session",
+    "plugin",
+    "middleware",
+    "cache",
+    "retry"
+  ],
+  "author": {
+    "name": "Aldwin Padronia",
+    "url": "https://github.com/whajqqbqkwjuw-oss"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/whajqqbqkwjuw-oss/kaisha-fca#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whajqqbqkwjuw-oss/kaisha-fca.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whajqqbqkwjuw-oss/kaisha-fca/issues"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "ws": "^8.17.1"
+  },
+  "files": [
+    "src/",
+    "types/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ]
+}
