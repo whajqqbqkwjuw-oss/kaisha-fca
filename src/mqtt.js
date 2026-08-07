@@ -307,13 +307,15 @@ function createMqttManager(session, logger, {
 
     logger.info('Connecting to Messenger MQTT broker…');
 
-    ws = new WebSocket(MQTT_HOST, ['mqtt'], {
+    ws = new WebSocket(MQTT_HOST, {
       headers: {
-        Cookie:   cookieString,
-        Origin:   'https://www.facebook.com',
+        Cookie: cookieString,
+        Origin: 'https://www.facebook.com',
+        Host: 'edge-chat.facebook.com',
+        Pragma: 'no-cache',
+        'Cache-Control': 'no-cache',
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
       },
     });
 
