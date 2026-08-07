@@ -165,8 +165,10 @@ function createMqttManager(session, logger, {
   /** @type {WebSocket|null} */
   let ws                  = null;
   let pingInterval        = null;
+  let connectTimeout      = null;
   let reconnectAttempts   = 0;
   let intentionallyClosed = false;
+  let sessionReady        = false;
   let packetIDCounter     = 1;
 
   /** @type {Map<string, Function[]>} */
@@ -207,7 +209,12 @@ function createMqttManager(session, logger, {
     // CONNACK = 2
     if (packetType === 2) {
       logger.debug('MQTT CONNACK received, subscribing to topics…');
+      sessionReady = true;
+      clearConnectTimeout();
+      reconnectAttempts = 0;
+      startPing();
       subscribeToTopics();
+      onConnect();
       return;
     }
 
@@ -293,6 +300,14 @@ function createMqttManager(session, logger, {
   }
 
   /**
+   * Stops the CONNACK watchdog timer.
+   */
+  function clearConnectTimeout() {
+    clearTimeout(connectTimeout);
+    connectTimeout = null;
+  }
+
+  /**
    * Opens the WebSocket connection and sends the MQTT CONNECT packet.
    *
    * @param {Function} onConnect - Called when the MQTT session is established.
@@ -319,12 +334,26 @@ function createMqttManager(session, logger, {
       },
     });
 
+    sessionReady = false;
+    clearConnectTimeout();
+
     ws.on('open', () => {
       logger.info('WebSocket open, sending MQTT CONNECT…');
       ws.send(buildConnectPacket(session));
-      startPing();
-      reconnectAttempts = 0;
-      onConnect();
+
+      clearConnectTimeout();
+      connectTimeout = setTimeout(() => {
+        if (!sessionReady && ws && ws.readyState === WebSocket.OPEN) {
+          logger.warn('MQTT CONNACK timeout; closing stale socket');
+          try {
+            ws.close(1002, 'CONNACK timeout');
+          } catch {}
+        }
+      }, 15000);
+
+      if (connectTimeout.unref) {
+        connectTimeout.unref();
+      }
     });
 
     ws.on('message', (data) => {
@@ -334,6 +363,7 @@ function createMqttManager(session, logger, {
     ws.on('close', async (code, reason) => {
       logger.warn(`Close code: ${code}`);
       logger.warn(`Close reason: ${Buffer.isBuffer(reason) ? reason.toString() : reason}`);
+      clearConnectTimeout();
       stopPing();
       const msg = `MQTT connection closed (code ${code}, reason: ${reason || 'none'})`;
       logger.warn(msg);
@@ -349,7 +379,7 @@ function createMqttManager(session, logger, {
         logger.info(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${maxReconnectAttempts})…`);
         await sleep(delay);
         connect(onConnect, onDisconnect, onError);
-      } else if (reconnectAttempts >= maxReconnectAttempts) {
+      } else if (!intentionallyClosed && reconnectAttempts >= maxReconnectAttempts) {
         onError(new Error('Max MQTT reconnect attempts reached'));
       }
     });
@@ -366,6 +396,8 @@ function createMqttManager(session, logger, {
    */
   function disconnect() {
     intentionallyClosed = true;
+    sessionReady = false;
+    clearConnectTimeout();
     stopPing();
     if (ws) {
       ws.close(1000, 'Client disconnect');
