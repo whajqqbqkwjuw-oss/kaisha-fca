@@ -968,9 +968,21 @@ function createAPI(session, httpClient, logger) {
       logger.child('Upload')
     );
 
+    // ✅ Validation: tiyaking may attachment ID
+    if (!uploaded || !uploaded.attachmentID) {
+      throw new Error('Failed to upload group image');
+    }
+
+    // ✅ Validation: tiyaking image ang na-upload
+    if (uploaded.attachmentType !== 'image') {
+      throw new Error(
+        `Expected image attachment but received "${uploaded.attachmentType || 'unknown'}"`
+      );
+    }
+
     const body = buildFormBody(session, {
       thread_fbid: threadID,
-      image_id:    uploaded.attachmentID,
+      image_id: uploaded.attachmentID,
     });
 
     const res = await httpClient.post(GROUP_IMAGE_URL, body, {
@@ -1054,7 +1066,52 @@ function createAPI(session, httpClient, logger) {
    * @returns {Promise<{ messageID: string }>}
    */
   async function sendImage(threadID, imageSource, caption = '') {
-    return sendAttachments(threadID, [imageSource], caption);
+    logger.debug(`Sending image to thread ${threadID}`);
+
+    const [uploaded] = await uploadAttachments(
+      [imageSource],
+      session,
+      httpClient,
+      logger.child('Upload')
+    );
+
+    // ✅ Validation: tiyaking may attachment ID
+    if (!uploaded || !uploaded.attachmentID) {
+      throw new Error('Failed to upload image');
+    }
+
+    // ✅ Validation: tiyaking image ang na-upload
+    if (uploaded.attachmentType !== 'image') {
+      throw new Error(
+        `Expected image attachment but received "${uploaded.attachmentType || 'unknown'}"`
+      );
+    }
+
+    const body = buildFormBody(session, {
+      action_type: 'ma-type:user-generated-message',
+      thread_fbid: threadID,
+      body: caption,
+      has_attachment: 'true',
+      message_id: generateOfflineThreadingID(),
+      client: 'mercury',
+      timestamp: String(Date.now()),
+      image_ids: uploaded.attachmentID,
+    });
+
+    const res = await httpClient.post(MESSENGER_SEND, body, {
+      headers: JSON_HEADERS,
+    });
+
+    const text = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    const msgIDMatch = text.match(/"message_id"\s*:\s*"([^"]+)"/);
+    const messageID = msgIDMatch ? msgIDMatch[1] : null;
+
+    if (!messageID && res.status >= 400) {
+      throw new Error(`Failed to send image (HTTP ${res.status})`);
+    }
+
+    logger.debug(`Image sent. Message ID: ${messageID}`);
+    return { messageID };
   }
 
   /**
@@ -1092,8 +1149,24 @@ function createAPI(session, httpClient, logger) {
       timestamp:      String(Date.now()),
     };
 
-    uploaded.forEach(({ attachmentID }, idx) => {
-      extra[`image_ids[${idx}]`] = attachmentID;
+    uploaded.forEach(({ attachmentID, type }, idx) => {
+      switch (type) {
+        case 'image':
+          extra[`image_ids[${idx}]`] = attachmentID;
+          break;
+
+        case 'video':
+          extra[`video_ids[${idx}]`] = attachmentID;
+          break;
+
+        case 'audio':
+          extra[`audio_ids[${idx}]`] = attachmentID;
+          break;
+
+        default:
+          extra[`file_ids[${idx}]`] = attachmentID;
+          break;
+      }
     });
 
     const body = buildFormBody(session, extra);
@@ -1373,15 +1446,25 @@ function createAPI(session, httpClient, logger) {
       logger.child('Upload')
     );
 
+    if (!uploaded || !uploaded.attachmentID) {
+      throw new Error('Failed to upload voice attachment');
+    }
+
+    if (uploaded.attachmentType !== 'audio') {
+      throw new Error(
+        `Expected audio attachment but received "${uploaded.attachmentType || 'unknown'}"`
+      );
+    }
+
     const body = buildFormBody(session, {
-      action_type:    'ma-type:user-generated-message',
-      thread_fbid:    threadID,
-      body:           '',
+      action_type: 'ma-type:user-generated-message',
+      thread_fbid: threadID,
+      body: '',
       has_attachment: 'true',
-      message_id:     generateOfflineThreadingID(),
-      client:         'mercury',
-      timestamp:      String(Date.now()),
-      audio_ids:      uploaded.attachmentID,
+      message_id: generateOfflineThreadingID(),
+      client: 'mercury',
+      timestamp: String(Date.now()),
+      audio_ids: uploaded.attachmentID,
     });
 
     const res = await httpClient.post(MESSENGER_SEND, body, {
@@ -1418,15 +1501,25 @@ function createAPI(session, httpClient, logger) {
       logger.child('Upload')
     );
 
+    if (!uploaded || !uploaded.attachmentID) {
+      throw new Error('Failed to upload document attachment');
+    }
+
+    if (uploaded.attachmentType !== 'file') {
+      throw new Error(
+        `Expected file attachment but received "${uploaded.attachmentType || 'unknown'}"`
+      );
+    }
+
     const body = buildFormBody(session, {
-      action_type:    'ma-type:user-generated-message',
-      thread_fbid:    threadID,
-      body:           caption,
+      action_type: 'ma-type:user-generated-message',
+      thread_fbid: threadID,
+      body: caption,
       has_attachment: 'true',
-      message_id:     generateOfflineThreadingID(),
-      client:         'mercury',
-      timestamp:      String(Date.now()),
-      file_ids:       uploaded.attachmentID,
+      message_id: generateOfflineThreadingID(),
+      client: 'mercury',
+      timestamp: String(Date.now()),
+      file_ids: uploaded.attachmentID,
     });
 
     const res = await httpClient.post(MESSENGER_SEND, body, {
