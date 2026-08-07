@@ -120,11 +120,16 @@ function loadFromAppState(appstate) {
   }
 
   const cookies = Object.create(null);
-  for (const entry of appstate) {
-    if (typeof entry.name === 'string' && typeof entry.value === 'string') {
-      cookies[entry.name] = entry.value;
-    }
+
+for (const entry of appstate) {
+  if (!entry || typeof entry !== 'object') continue;
+
+  const cookieName = entry.name || entry.key;
+
+  if (typeof cookieName === 'string' && typeof entry.value === 'string') {
+    cookies[cookieName] = entry.value;
   }
+}
 
   if (!cookies['c_user']) {
     throw new SessionError(
