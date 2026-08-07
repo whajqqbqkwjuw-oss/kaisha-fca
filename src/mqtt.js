@@ -307,7 +307,7 @@ function createMqttManager(session, logger, {
 
     logger.info('Connecting to Messenger MQTT broker…');
 
-    ws = new WebSocket(MQTT_HOST, 'MQTToT', {
+    ws = new WebSocket(MQTT_HOST, ['mqtt'], {
       headers: {
         Cookie:   cookieString,
         Origin:   'https://www.facebook.com',
@@ -330,6 +330,8 @@ function createMqttManager(session, logger, {
     });
 
     ws.on('close', async (code, reason) => {
+      logger.warn(`Close code: ${code}`);
+      logger.warn(`Close reason: ${Buffer.isBuffer(reason) ? reason.toString() : reason}`);
       stopPing();
       const msg = `MQTT connection closed (code ${code}, reason: ${reason || 'none'})`;
       logger.warn(msg);
@@ -351,7 +353,8 @@ function createMqttManager(session, logger, {
     });
 
     ws.on('error', (err) => {
-      logger.error('WebSocket error:', err.message);
+      logger.error('WebSocket error:', err);
+      logger.error(err?.stack || '');
       onError(err);
     });
   }
