@@ -210,16 +210,41 @@ function createMqttManager(session, logger, {
   function handleIncoming(data) {
     if (!Buffer.isBuffer(data)) data = Buffer.from(data);
 
+    if (data.length === 0) {
+      logger.warn('MQTT received an empty packet');
+      return;
+    }
+
     const packetType = (data[0] & 0xF0) >> 4;
+
+    logger.info(
+      `MQTT packet received: type=${packetType}, flags=0x${(data[0] & 0x0F).toString(16)}, length=${data.length}`
+    );
 
     // CONNACK = 2
     if (packetType === 2) {
-      logger.debug('MQTT CONNACK received, subscribing to topics…');
+      logger.info(`MQTT CONNACK received: ${data.toString('hex')}`);
+
+      if (data.length >= 4) {
+        const connectAckFlags = data[2];
+        const returnCode = data[3];
+
+        logger.info(
+          `MQTT CONNACK flags=0x${connectAckFlags.toString(16)}, returnCode=${returnCode}`
+        );
+
+        if (returnCode !== 0) {
+          logger.error(`MQTT broker rejected CONNECT with return code ${returnCode}`);
+          return;
+        }
+      }
+
       sessionReady = true;
       clearConnectTimeout();
       reconnectAttempts = 0;
       startPing();
       subscribeToTopics();
+
       if (_onConnect) _onConnect();
       return;
     }
@@ -350,7 +375,18 @@ function createMqttManager(session, logger, {
 
     ws.on('open', () => {
       logger.info('WebSocket open, sending MQTT CONNECT…');
-      ws.send(buildConnectPacket(session));
+
+      const connectPacket = buildConnectPacket(session);
+
+      logger.info(
+        `MQTT CONNECT packet: ${connectPacket.length} bytes`
+      );
+
+      logger.info(
+        `MQTT CONNECT hex: ${connectPacket.toString('hex').slice(0, 500)}`
+      );
+
+      ws.send(connectPacket);
 
       clearConnectTimeout();
       connectTimeout = setTimeout(() => {
@@ -368,7 +404,19 @@ function createMqttManager(session, logger, {
     });
 
     ws.on('message', (data) => {
-      handleIncoming(Buffer.isBuffer(data) ? data : Buffer.from(data));
+      const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+
+      const packetType = buffer.length > 0
+        ? ((buffer[0] & 0xF0) >> 4)
+        : -1;
+
+      logger.info(
+        `MQTT RX: ${buffer.length} bytes, type=${packetType}, hex=${buffer
+          .toString('hex')
+          .slice(0, 300)}`
+      );
+
+      handleIncoming(buffer);
     });
 
     ws.on('close', async (code, reason) => {
