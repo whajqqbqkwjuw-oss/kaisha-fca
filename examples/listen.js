@@ -34,13 +34,21 @@ healthServer.listen(PORT, '0.0.0.0', () => {
 const kaisha = require('../src/index');
 
 async function main() {
-  const sessionPath = path.resolve(__dirname, '../session.json');
-  if (!fs.existsSync(sessionPath)) {
-    console.error(`session.json not found at ${sessionPath}. Run examples/login.js first.`);
-    process.exit(1);
-  }
+  const appstatePath = path.resolve(__dirname, '../appstate.json');
 
-  const appstate = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
+if (!fs.existsSync(appstatePath)) {
+  console.error(`appstate.json not found at ${appstatePath}.`);
+  process.exit(1);
+}
+
+const appstate = JSON.parse(fs.readFileSync(appstatePath, 'utf8'));
+
+if (!Array.isArray(appstate)) {
+  console.error('Invalid appstate.json format. Expected an array of cookies.');
+  process.exit(1);
+}
+
+console.log(`Loaded ${appstate.length} appstate cookies.`);
 
   const client = await kaisha.login(
     { type: 'appstate', appstate },
