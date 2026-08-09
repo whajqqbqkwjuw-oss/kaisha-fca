@@ -13,7 +13,7 @@ const WebSocket = require('ws');
 const { sleep, randomInt } = require('./utils');
 
 const MQTT_HOST = 'wss://edge-chat.messenger.com/chat';
-const MQTT_KEEPALIVE = 10;
+const MQTT_KEEPALIVE = 60;
 
 const CONNECT_PACKET_TYPE = 0x10;
 const SUBSCRIBE_PACKET_TYPE = 0x82;
