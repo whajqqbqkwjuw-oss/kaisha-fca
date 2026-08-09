@@ -13,6 +13,24 @@
 
 const path   = require('path');
 const fs     = require('fs');
+const http = require('http');
+
+const PORT = process.env.PORT || 3000;
+
+const healthServer = http.createServer((req, res) => {
+  if (req.url === '/healthz') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('OK');
+    return;
+  }
+
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Kaisha is running');
+});
+
+healthServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Health server listening on port ${PORT}`);
+});
 const kaisha = require('../src/index');
 
 async function main() {
