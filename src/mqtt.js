@@ -585,32 +585,63 @@ function createMqttManager(
       }
     });
 
+    // ✅ Pinalitan ang ws.on('message') block
     ws.on('message', (data) => {
-      try {
-        const buffer = Buffer.isBuffer(data)
-          ? data
-          : Buffer.from(data);
+      const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
 
-        handleIncoming(buffer);
-      } catch (err) {
-        logger.error(
-          'MQTT message processing failed:',
-          err
-        );
+      if (buffer.length === 0) {
+        logger.warn('MQTT RX: empty packet');
+        return;
       }
+
+      const packetType = (buffer[0] & 0xF0) >> 4;
+      const flags = buffer[0] & 0x0F;
+
+      logger.info(
+        `MQTT RX: ${buffer.length} bytes, type=${packetType}, flags=0x${flags.toString(16)}`
+      );
+
+      // Safe diagnostic: only show the first bytes, never cookies/auth data.
+      logger.debug(
+        `MQTT RX HEX: ${buffer.toString('hex').slice(0, 64)}`
+      );
+
+      if (packetType === 2) {
+        if (buffer.length >= 4) {
+          const returnCode = buffer[3];
+
+          logger.info(
+            `MQTT CONNACK received, returnCode=${returnCode}`
+          );
+
+          if (returnCode === 0) {
+            logger.info('MQTT broker accepted CONNECT');
+          } else {
+            logger.error(
+              `MQTT broker rejected CONNECT with return code ${returnCode}`
+            );
+          }
+        } else {
+          logger.warn('MQTT CONNACK packet is too short');
+        }
+      }
+
+      handleIncoming(buffer);
     });
 
     ws.on('close', async (code, reason) => {
       clearConnectTimeout();
       stopPing();
 
-      const reasonText = Buffer.isBuffer(reason)
-        ? reason.toString()
+      // ✅ In-update ang close message format
+      const closeReason = Buffer.isBuffer(reason)
+        ? reason.toString('utf8')
         : String(reason || '');
 
-      logger.warn(
-        `MQTT connection closed: code=${code}, reason=${reasonText || 'none'}`
-      );
+      const msg =
+        `MQTT connection closed: code=${code}, reason=${closeReason || 'none'}`;
+
+      logger.warn(msg);
 
       sessionReady = false;
 
