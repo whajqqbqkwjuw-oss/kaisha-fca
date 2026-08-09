@@ -2,107 +2,182 @@
 
 /**
  * @module mqtt
- * @description Manages the MQTT-over-WebSocket connection to Facebook's
- * Messenger real-time infrastructure, including message parsing and
- * automatic reconnection.
+ * @description
+ * Low-level MQTT-over-WebSocket transport for Messenger realtime events.
+ *
+ * This implementation intentionally builds MQTT packets directly instead
+ * of depending on an MQTT client or an existing Messenger library.
  */
 
 const WebSocket = require('ws');
 const { sleep, randomInt } = require('./utils');
 
-const MQTT_HOST      = 'wss://edge-chat.facebook.com/chat';
-const MQTT_KEEPALIVE = 60;
+const MQTT_HOST = 'wss://edge-chat.messenger.com/chat';
+const MQTT_KEEPALIVE = 10;
+
 const CONNECT_PACKET_TYPE = 0x10;
 const SUBSCRIBE_PACKET_TYPE = 0x82;
 const PINGREQ_PACKET_TYPE = 0xC0;
 
-/**
- * Encodes a UTF-8 string as an MQTT-prefixed length string (2-byte big-endian
- * length prefix followed by the raw bytes).
- *
- * @param {string} str
- * @returns {Buffer}
- */
 function encodeMqttString(str) {
-  const strBuf = Buffer.from(str, 'utf8');
-  const lenBuf = Buffer.alloc(2);
-  lenBuf.writeUInt16BE(strBuf.length, 0);
-  return Buffer.concat([lenBuf, strBuf]);
+  const value = Buffer.from(String(str ?? ''), 'utf8');
+
+  if (value.length > 0xffff) {
+    throw new Error('MQTT string exceeds 65535 bytes');
+  }
+
+  const length = Buffer.allocUnsafe(2);
+  length.writeUInt16BE(value.length, 0);
+
+  return Buffer.concat([length, value]);
 }
 
-/**
- * Encodes the MQTT remaining-length field using the variable-length encoding
- * defined in the MQTT specification.
- *
- * @param {number} length
- * @returns {Buffer}
- */
 function encodeRemainingLength(length) {
+  if (!Number.isInteger(length) || length < 0) {
+    throw new Error('Invalid MQTT remaining length');
+  }
+
   const bytes = [];
   let remaining = length;
+
   do {
-    let byte = remaining % 128;
+    let encoded = remaining % 128;
     remaining = Math.floor(remaining / 128);
-    if (remaining > 0) byte |= 0x80;
-    bytes.push(byte);
+
+    if (remaining > 0) {
+      encoded |= 0x80;
+    }
+
+    bytes.push(encoded);
   } while (remaining > 0);
+
   return Buffer.from(bytes);
 }
 
-/**
- * Builds a minimal MQTT CONNECT packet for Facebook's Messenger broker.
- *
- * @param {import('./session').Session} session
- * @returns {Buffer}
- */
+function decodeRemainingLength(data, offset = 1) {
+  let multiplier = 1;
+  let value = 0;
+  let position = offset;
+
+  for (let i = 0; i < 4; i++) {
+    if (position >= data.length) {
+      throw new Error('Incomplete MQTT remaining-length field');
+    }
+
+    const byte = data[position++];
+
+    value += (byte & 0x7f) * multiplier;
+
+    if ((byte & 0x80) === 0) {
+      return {
+        value,
+        offset: position,
+      };
+    }
+
+    multiplier *= 128;
+  }
+
+  throw new Error('Malformed MQTT remaining-length field');
+}
+
 function buildConnectPacket(session) {
-  const { userID, clientID, cookies } = session.data;
-  const cUser = cookies['c_user'] || userID;
-  const xs    = cookies['xs'] || '';
-  const locale = 'en_US';
+  const {
+    userID,
+    clientID,
+    cookies = {},
+  } = session.data;
 
-  // Payload: clientID as MQTT client identifier
-  const clientIDBuf = encodeMqttString(clientID);
+  const cUser = cookies.c_user || userID;
+  const xs = cookies.xs || '';
 
-  // CONNECT variable header: Protocol name, level, flags, keepalive
-  const protocolName  = encodeMqttString('MQTToT');
-  const protocolLevel = Buffer.from([3]); // MQTT 3.1
-  const connectFlags  = Buffer.from([0xC2]); // clean session + username flag
-  const keepalive     = Buffer.alloc(2);
-  keepalive.writeUInt16BE(MQTT_KEEPALIVE, 0);
+  if (!cUser) {
+    throw new Error('Missing c_user/userID for MQTT authentication');
+  }
 
-  // Username is a JSON payload Facebook uses for auth
+  if (!xs) {
+    throw new Error('Missing xs cookie for MQTT authentication');
+  }
+
+  const mqttClientID = String(clientID || '');
+
   const username = JSON.stringify({
-    u: cUser,
-    s: xs,
+    u: String(cUser),
+    s: String(xs),
+
     cp: 3,
     ecp: 10,
+
     chat_on: true,
     fg: false,
-    d: clientID,
+
+    d: mqttClientID,
     ct: 'websocket',
+
     mqtt_sid: '',
-    aid: 219994525426954,
-    st: [],
+
+    aid: '219994525426954',
+
+    st: [
+      '/t_ms',
+      '/thread_typing',
+      '/orca_typing_notifications',
+      '/orca_presence',
+      '/inbox',
+      '/mercury',
+      '/messaging_events',
+      '/webrtc',
+      '/br_sr',
+      '/sr_res',
+      '/pp',
+      '/webrtc_response',
+    ],
+
     pm: [],
+
     dc: '',
     no_auto_fg: true,
+
     gas: null,
     pack: [],
-    locale,
+
+    locale: 'en_US',
   });
 
-  const usernameBuf = encodeMqttString(username);
-
+  /*
+   * MQTT 3.1 / MQIsdp.
+   *
+   * Messenger-compatible implementations historically use:
+   *
+   * protocolId     = MQIsdp
+   * protocolLevel  = 3
+   * clean session   = true
+   * username flag   = true
+   */
   const variableHeader = Buffer.concat([
-    protocolName,
-    protocolLevel,
-    connectFlags,
-    keepalive,
+    encodeMqttString('MQIsdp'),
+    Buffer.from([3]),
+    Buffer.from([0xC2]),
+    Buffer.from([
+      (MQTT_KEEPALIVE >> 8) & 0xff,
+      MQTT_KEEPALIVE & 0xff,
+    ]),
   ]);
 
-  const payload = Buffer.concat([clientIDBuf, usernameBuf]);
-  const remaining = encodeRemainingLength(variableHeader.length + payload.length);
+  /*
+   * CONNECT payload:
+   *
+   * client identifier
+   * username JSON
+   */
+  const payload = Buffer.concat([
+    encodeMqttString(mqttClientID),
+    encodeMqttString(username),
+  ]);
+
+  const remaining = encodeRemainingLength(
+    variableHeader.length + payload.length
+  );
 
   return Buffer.concat([
     Buffer.from([CONNECT_PACKET_TYPE]),
@@ -112,376 +187,541 @@ function buildConnectPacket(session) {
   ]);
 }
 
-/**
- * Builds an MQTT SUBSCRIBE packet for the given topics.
- *
- * @param {Array<{topic:string, qos:number}>} subscriptions
- * @param {number} packetID
- * @returns {Buffer}
- */
 function buildSubscribePacket(subscriptions, packetID) {
-  const packetIDBuf = Buffer.alloc(2);
-  packetIDBuf.writeUInt16BE(packetID, 0);
+  const id = Buffer.allocUnsafe(2);
+  id.writeUInt16BE(packetID & 0xffff, 0);
 
-  const topicBufs = subscriptions.map(({ topic, qos }) =>
-    Buffer.concat([encodeMqttString(topic), Buffer.from([qos])])
-  );
+  const topics = subscriptions.map(({ topic, qos = 0 }) => {
+    return Buffer.concat([
+      encodeMqttString(topic),
+      Buffer.from([qos & 0x03]),
+    ]);
+  });
 
-  const payload  = Buffer.concat(topicBufs);
-  const body     = Buffer.concat([packetIDBuf, payload]);
-  const remaining = encodeRemainingLength(body.length);
+  const body = Buffer.concat([
+    id,
+    ...topics,
+  ]);
 
   return Buffer.concat([
     Buffer.from([SUBSCRIBE_PACKET_TYPE]),
-    remaining,
+    encodeRemainingLength(body.length),
     body,
   ]);
 }
 
-/**
- * Builds an MQTT PINGREQ packet.
- *
- * @returns {Buffer}
- */
 function buildPingPacket() {
   return Buffer.from([PINGREQ_PACKET_TYPE, 0x00]);
 }
 
-/**
- * Creates an MQTT manager that maintains the WebSocket connection to Facebook
- * Messenger and exposes a message callback interface.
- *
- * @param {import('./session').Session} session
- * @param {import('./logger').Logger} logger
- * @param {object} options
- * @param {number} [options.maxReconnectAttempts=10]
- * @param {number} [options.reconnectBaseDelay=2000]
- * @returns {MqttManager}
- */
-function createMqttManager(session, logger, {
-  maxReconnectAttempts = 10,
-  reconnectBaseDelay   = 2_000,
-} = {}) {
-  /** @type {WebSocket|null} */
-  let ws                  = null;
-  let pingInterval        = null;
-  let connectTimeout      = null;
-  let reconnectAttempts   = 0;
-  let intentionallyClosed = false;
-  let sessionReady        = false;
-  let packetIDCounter     = 1;
+function createMqttManager(
+  session,
+  logger,
+  {
+    maxReconnectAttempts = 10,
+    reconnectBaseDelay = 2000,
+  } = {}
+) {
+  let ws = null;
+  let pingInterval = null;
+  let connectTimeout = null;
 
-  /** @type {Map<string, Function[]>} */
+  let reconnectAttempts = 0;
+  let intentionallyClosed = false;
+  let sessionReady = false;
+  let packetIDCounter = 1;
+
   const handlers = new Map();
 
-  // Stored callbacks — set by connect() so handleIncoming can call them even
-  // though handleIncoming is defined at the createMqttManager closure level.
-  /** @type {Function|null} */ let _onConnect    = null;
-  /** @type {Function|null} */ let _onDisconnect = null;
-  /** @type {Function|null} */ let _onError      = null;
+  let onConnectCallback = null;
+  let onDisconnectCallback = null;
+  let onErrorCallback = null;
 
-  /**
-   * Registers a callback for raw MQTT topic messages.
-   *
-   * @param {string} topic
-   * @param {Function} fn - Called with (payload: Buffer)
-   */
   function on(topic, fn) {
-    if (!handlers.has(topic)) handlers.set(topic, []);
+    if (typeof fn !== 'function') {
+      throw new TypeError('MQTT handler must be a function');
+    }
+
+    if (!handlers.has(topic)) {
+      handlers.set(topic, []);
+    }
+
     handlers.get(topic).push(fn);
   }
 
-  /**
-   * Dispatches a received payload to the appropriate topic handlers.
-   *
-   * @param {string} topic
-   * @param {Buffer} payload
-   */
   function dispatch(topic, payload) {
-    const fns = handlers.get(topic) ?? handlers.get('*') ?? [];
-    for (const fn of fns) fn(payload);
+    const exact = handlers.get(topic) || [];
+    const wildcard = handlers.get('*') || [];
+
+    for (const fn of [...exact, ...wildcard]) {
+      try {
+        fn(payload, topic);
+      } catch (err) {
+        logger.error(
+          `MQTT topic handler failed for ${topic}:`,
+          err
+        );
+      }
+    }
   }
 
-  /**
-   * Parses a raw incoming MQTT packet buffer and dispatches PUBLISH messages.
-   *
-   * @param {Buffer} data
-   */
-  function handleIncoming(data) {
-    if (!Buffer.isBuffer(data)) data = Buffer.from(data);
+  function clearConnectTimeout() {
+    if (connectTimeout) {
+      clearTimeout(connectTimeout);
+      connectTimeout = null;
+    }
+  }
 
-    if (data.length === 0) {
-      logger.warn('MQTT received an empty packet');
+  function stopPing() {
+    if (pingInterval) {
+      clearInterval(pingInterval);
+      pingInterval = null;
+    }
+  }
+
+  function startPing() {
+    stopPing();
+
+    pingInterval = setInterval(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      try {
+        ws.send(buildPingPacket());
+        logger.debug('MQTT PINGREQ sent');
+      } catch (err) {
+        logger.warn('Failed to send MQTT PINGREQ:', err);
+      }
+    }, (MQTT_KEEPALIVE / 2) * 1000);
+
+    if (typeof pingInterval.unref === 'function') {
+      pingInterval.unref();
+    }
+  }
+
+  function subscribeToTopics() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      logger.warn('Cannot subscribe: MQTT WebSocket is not open');
       return;
     }
 
-    const packetType = (data[0] & 0xF0) >> 4;
+    const topics = [
+      { topic: '/t_ms', qos: 0 },
+      { topic: '/thread_typing', qos: 0 },
+      { topic: '/orca_typing_notifications', qos: 0 },
+      { topic: '/orca_presence', qos: 0 },
+      { topic: '/inbox', qos: 0 },
+      { topic: '/mercury', qos: 0 },
+      { topic: '/messaging_events', qos: 0 },
+      { topic: '/webrtc', qos: 0 },
+      { topic: '/br_sr', qos: 0 },
+      { topic: '/sr_res', qos: 0 },
+      { topic: '/pp', qos: 0 },
+      { topic: '/webrtc_response', qos: 0 },
+    ];
 
-    logger.info(
-      `MQTT packet received: type=${packetType}, flags=0x${(data[0] & 0x0F).toString(16)}, length=${data.length}`
+    const packet = buildSubscribePacket(
+      topics,
+      packetIDCounter++
     );
 
-    // CONNACK = 2
+    ws.send(packet);
+
+    logger.info(
+      `MQTT SUBSCRIBE sent (${topics.length} topics)`
+    );
+  }
+
+  function handleIncoming(data) {
+    if (!Buffer.isBuffer(data)) {
+      data = Buffer.from(data);
+    }
+
+    if (data.length < 2) {
+      logger.warn('MQTT received an incomplete packet');
+      return;
+    }
+
+    const packetType = (data[0] & 0xf0) >> 4;
+    const flags = data[0] & 0x0f;
+
+    let remaining;
+
+    try {
+      remaining = decodeRemainingLength(data);
+    } catch (err) {
+      logger.error('Failed to decode MQTT packet:', err);
+      return;
+    }
+
+    logger.info(
+      `MQTT RX: type=${packetType}, flags=0x${flags.toString(16)}, remaining=${remaining.value}, bytes=${data.length}`
+    );
+
+    /*
+     * CONNACK
+     */
     if (packetType === 2) {
-      logger.info(`MQTT CONNACK received: ${data.toString('hex')}`);
+      if (data.length < remaining.offset + 2) {
+        logger.error('Invalid MQTT CONNACK packet');
+        return;
+      }
 
-      if (data.length >= 4) {
-        const connectAckFlags = data[2];
-        const returnCode = data[3];
+      const ackFlags = data[remaining.offset];
+      const returnCode = data[remaining.offset + 1];
 
-        logger.info(
-          `MQTT CONNACK flags=0x${connectAckFlags.toString(16)}, returnCode=${returnCode}`
+      logger.info(
+        `MQTT CONNACK: flags=0x${ackFlags.toString(16)}, returnCode=${returnCode}`
+      );
+
+      clearConnectTimeout();
+
+      if (returnCode !== 0) {
+        sessionReady = false;
+
+        const error = new Error(
+          `MQTT CONNECT rejected by broker (return code ${returnCode})`
         );
 
-        if (returnCode !== 0) {
-          logger.error(`MQTT broker rejected CONNECT with return code ${returnCode}`);
-          return;
+        logger.error(error.message);
+
+        if (onErrorCallback) {
+          onErrorCallback(error);
         }
+
+        return;
       }
 
       sessionReady = true;
-      clearConnectTimeout();
       reconnectAttempts = 0;
+
+      logger.info('MQTT session established successfully');
+
       startPing();
       subscribeToTopics();
 
-      if (_onConnect) _onConnect();
+      if (onConnectCallback) {
+        onConnectCallback();
+      }
+
       return;
     }
 
-    // PUBLISH = 3
+    /*
+     * PUBLISH
+     */
     if (packetType === 3) {
-      let offset = 1;
+      let offset = remaining.offset;
 
-      // Decode remaining length
-      let multiplier = 1;
-      let remainingLength = 0;
-      let byte;
-      do {
-        byte = data[offset++];
-        remainingLength += (byte & 0x7F) * multiplier;
-        multiplier *= 128;
-      } while (byte & 0x80);
+      if (offset + 2 > data.length) {
+        logger.warn('Invalid MQTT PUBLISH: missing topic length');
+        return;
+      }
 
-      // Topic length
       const topicLength = data.readUInt16BE(offset);
       offset += 2;
-      const topic = data.slice(offset, offset + topicLength).toString('utf8');
+
+      if (offset + topicLength > data.length) {
+        logger.warn('Invalid MQTT PUBLISH: incomplete topic');
+        return;
+      }
+
+      const topic = data
+        .subarray(offset, offset + topicLength)
+        .toString('utf8');
+
       offset += topicLength;
 
-      // QoS level from fixed header
       const qos = (data[0] & 0x06) >> 1;
+
       if (qos > 0) {
-        // Skip packet identifier
+        if (offset + 2 > data.length) {
+          logger.warn(
+            'Invalid MQTT PUBLISH: missing packet identifier'
+          );
+          return;
+        }
+
         offset += 2;
       }
 
-      const payload = data.slice(offset);
+      const payload = data.subarray(offset);
+
+      logger.debug(
+        `MQTT PUBLISH topic=${topic}, payload=${payload.length} bytes`
+      );
+
       dispatch(topic, payload);
       return;
     }
 
-    // PINGRESP = 13
+    /*
+     * PINGRESP
+     */
     if (packetType === 13) {
       logger.debug('MQTT PINGRESP received');
+      return;
     }
+
+    /*
+     * SUBACK
+     */
+    if (packetType === 9) {
+      logger.debug('MQTT SUBACK received');
+      return;
+    }
+
+    logger.debug(
+      `Unhandled MQTT packet type=${packetType}`
+    );
   }
 
-  /**
-   * Sends the MQTT SUBSCRIBE packet for all required Messenger topics.
-   */
-  function subscribeToTopics() {
-    const topics = [
-      { topic: '/t_ms',          qos: 0 },
-      { topic: '/thread_typing', qos: 0 },
-      { topic: '/orca_typing_notifications', qos: 0 },
-      { topic: '/orca_presence',             qos: 0 },
-      { topic: '/inbox',                     qos: 0 },
-      { topic: '/mercury',                   qos: 0 },
-      { topic: '/messaging_events',          qos: 0 },
-      { topic: '/webrtc',                    qos: 0 },
-      { topic: '/br_sr',                     qos: 0 },
-      { topic: '/sr_res',                    qos: 0 },
-    ];
-
-    const packet = buildSubscribePacket(topics, packetIDCounter++);
-    ws.send(packet);
-    logger.info('Subscribed to Messenger MQTT topics');
-  }
-
-  /**
-   * Starts the PING interval to keep the MQTT connection alive.
-   */
-  function startPing() {
-    clearInterval(pingInterval);
-    pingInterval = setInterval(() => {
-      if (ws?.readyState === WebSocket.OPEN) {
-        ws.send(buildPingPacket());
-        logger.debug('MQTT PINGREQ sent');
-      }
-    }, (MQTT_KEEPALIVE / 2) * 1000);
-  }
-
-  /**
-   * Stops the PING interval.
-   */
-  function stopPing() {
-    clearInterval(pingInterval);
-    pingInterval = null;
-  }
-
-  /**
-   * Stops the CONNACK watchdog timer.
-   */
-  function clearConnectTimeout() {
-    clearTimeout(connectTimeout);
-    connectTimeout = null;
-  }
-
-  /**
-   * Opens the WebSocket connection and sends the MQTT CONNECT packet.
-   *
-   * @param {Function} onConnect - Called when the MQTT session is established.
-   * @param {Function} onDisconnect - Called when the connection closes.
-   * @param {Function} onError - Called with an Error on fatal errors.
-   */
   function connect(onConnect, onDisconnect, onError) {
-    // Store callbacks so handleIncoming (defined outside connect) can call them.
-    _onConnect    = onConnect;
-    _onDisconnect = onDisconnect;
-    _onError      = onError;
+    onConnectCallback = onConnect;
+    onDisconnectCallback = onDisconnect;
+    onErrorCallback = onError;
 
-    const { cookies } = session.data;
+    intentionallyClosed = false;
+
+    const { cookies = {}, clientID } = session.data;
+
     const cookieString = Object.entries(cookies)
-      .map(([k, v]) => `${k}=${v}`)
+      .map(([key, value]) => `${key}=${value}`)
       .join('; ');
 
-    logger.info('Connecting to Messenger MQTT broker…');
+    const sid =
+      `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 
-    ws = new WebSocket(MQTT_HOST, {
+    const cid = encodeURIComponent(
+      String(clientID || '')
+    );
+
+    /*
+     * Messenger's WebSocket endpoint expects session/client
+     * identifiers in the connection URL.
+     */
+    const mqttUrl =
+      `${MQTT_HOST}?sid=${encodeURIComponent(sid)}&cid=${cid}`;
+
+    logger.info('Connecting to Messenger MQTT broker…');
+    logger.debug(
+      `MQTT endpoint: ${MQTT_HOST}?sid=...&cid=...`
+    );
+
+    ws = new WebSocket(mqttUrl, {
       headers: {
         Cookie: cookieString,
-        Origin: 'https://www.facebook.com',
-        Host: 'edge-chat.facebook.com',
+        Origin: 'https://www.messenger.com',
+        Referer: 'https://www.messenger.com/',
+        Host: 'edge-chat.messenger.com',
         Pragma: 'no-cache',
         'Cache-Control': 'no-cache',
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+          'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+          'Chrome/138.0.0.0 Safari/537.36',
       },
+
+      protocolVersion: 13,
+
+      handshakeTimeout: 30_000,
     });
 
     sessionReady = false;
     clearConnectTimeout();
+    stopPing();
 
     ws.on('open', () => {
-      logger.info('WebSocket open, sending MQTT CONNECT…');
-
-      const connectPacket = buildConnectPacket(session);
-
       logger.info(
-        `MQTT CONNECT packet: ${connectPacket.length} bytes`
+        'WebSocket open, sending MQTT CONNECT…'
       );
 
-      logger.info(
-        `MQTT CONNECT hex: ${connectPacket.toString('hex').slice(0, 500)}`
-      );
+      try {
+        const packet = buildConnectPacket(session);
 
-      ws.send(connectPacket);
+        logger.info(
+          `MQTT CONNECT packet created (${packet.length} bytes)`
+        );
+
+        /*
+         * Do NOT log the packet hex because it contains
+         * authentication material.
+         */
+        ws.send(packet);
+      } catch (err) {
+        logger.error(
+          'Failed to create/send MQTT CONNECT:',
+          err
+        );
+
+        if (onErrorCallback) {
+          onErrorCallback(err);
+        }
+
+        return;
+      }
 
       clearConnectTimeout();
+
       connectTimeout = setTimeout(() => {
-        if (!sessionReady && ws && ws.readyState === WebSocket.OPEN) {
-          logger.warn('MQTT CONNACK timeout; closing stale socket');
+        if (
+          !sessionReady &&
+          ws &&
+          ws.readyState === WebSocket.OPEN
+        ) {
+          logger.warn(
+            'MQTT CONNACK timeout; closing stale connection'
+          );
+
           try {
             ws.close(1002, 'CONNACK timeout');
           } catch {}
         }
-      }, 15000);
+      }, 15_000);
 
-      if (connectTimeout.unref) {
+      if (typeof connectTimeout.unref === 'function') {
         connectTimeout.unref();
       }
     });
 
     ws.on('message', (data) => {
-      const buffer = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      try {
+        const buffer = Buffer.isBuffer(data)
+          ? data
+          : Buffer.from(data);
 
-      const packetType = buffer.length > 0
-        ? ((buffer[0] & 0xF0) >> 4)
-        : -1;
-
-      logger.info(
-        `MQTT RX: ${buffer.length} bytes, type=${packetType}, hex=${buffer
-          .toString('hex')
-          .slice(0, 300)}`
-      );
-
-      handleIncoming(buffer);
+        handleIncoming(buffer);
+      } catch (err) {
+        logger.error(
+          'MQTT message processing failed:',
+          err
+        );
+      }
     });
 
     ws.on('close', async (code, reason) => {
-      logger.warn(`Close code: ${code}`);
-      logger.warn(`Close reason: ${Buffer.isBuffer(reason) ? reason.toString() : reason}`);
       clearConnectTimeout();
       stopPing();
-      const msg = `MQTT connection closed (code ${code}, reason: ${reason || 'none'})`;
-      logger.warn(msg);
-      onDisconnect(code);
 
-      if (!intentionallyClosed && reconnectAttempts < maxReconnectAttempts) {
-        reconnectAttempts++;
-        const delay = Math.min(
-          reconnectBaseDelay * Math.pow(2, reconnectAttempts - 1) +
-            randomInt(0, 500),
-          30_000
+      const reasonText = Buffer.isBuffer(reason)
+        ? reason.toString()
+        : String(reason || '');
+
+      logger.warn(
+        `MQTT connection closed: code=${code}, reason=${reasonText || 'none'}`
+      );
+
+      sessionReady = false;
+
+      if (onDisconnectCallback) {
+        onDisconnectCallback(code);
+      }
+
+      if (
+        intentionallyClosed ||
+        reconnectAttempts >= maxReconnectAttempts
+      ) {
+        if (
+          !intentionallyClosed &&
+          reconnectAttempts >= maxReconnectAttempts &&
+          onErrorCallback
+        ) {
+          onErrorCallback(
+            new Error(
+              'Maximum MQTT reconnect attempts reached'
+            )
+          );
+        }
+
+        return;
+      }
+
+      reconnectAttempts++;
+
+      const delay = Math.min(
+        reconnectBaseDelay *
+          Math.pow(2, reconnectAttempts - 1) +
+          randomInt(0, 500),
+        30_000
+      );
+
+      logger.info(
+        `Reconnecting in ${delay}ms ` +
+        `(attempt ${reconnectAttempts}/${maxReconnectAttempts})…`
+      );
+
+      await sleep(delay);
+
+      if (!intentionallyClosed) {
+        connect(
+          onConnect,
+          onDisconnect,
+          onError
         );
-        logger.info(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts}/${maxReconnectAttempts})…`);
-        await sleep(delay);
-        connect(onConnect, onDisconnect, onError);
-      } else if (!intentionallyClosed && reconnectAttempts >= maxReconnectAttempts) {
-        onError(new Error('Max MQTT reconnect attempts reached'));
       }
     });
 
     ws.on('error', (err) => {
-      logger.error('WebSocket error:', err);
-      logger.error(err?.stack || '');
-      onError(err);
+      logger.error(
+        `MQTT WebSocket error: ${err?.message || err}`
+      );
+
+      if (err?.stack) {
+        logger.debug(err.stack);
+      }
+
+      /*
+       * ws normally emits close after error. We do not
+       * reconnect here directly to avoid duplicate reconnects.
+       */
+      if (onErrorCallback && sessionReady) {
+        onErrorCallback(err);
+      }
     });
   }
 
-  /**
-   * Gracefully closes the MQTT connection without triggering reconnection.
-   */
   function disconnect() {
     intentionallyClosed = true;
     sessionReady = false;
+
     clearConnectTimeout();
     stopPing();
+
     if (ws) {
-      ws.close(1000, 'Client disconnect');
+      try {
+        if (
+          ws.readyState === WebSocket.OPEN ||
+          ws.readyState === WebSocket.CONNECTING
+        ) {
+          ws.close(1000, 'Client disconnect');
+        }
+      } catch {}
+
       ws = null;
     }
-    logger.info('MQTT connection closed by client');
+
+    logger.info(
+      'MQTT connection closed by client'
+    );
   }
 
-  /**
-   * Returns whether the WebSocket is currently open.
-   *
-   * @returns {boolean}
-   */
   function isConnected() {
-    return ws !== null && ws.readyState === WebSocket.OPEN;
+    return (
+      ws !== null &&
+      ws.readyState === WebSocket.OPEN &&
+      sessionReady
+    );
   }
 
-  /**
-   * @typedef {object} MqttManager
-   * @property {function} connect
-   * @property {function} disconnect
-   * @property {function} isConnected
-   * @property {function} on
-   */
-  return { connect, disconnect, isConnected, on };
+  return {
+    connect,
+    disconnect,
+    isConnected,
+    on,
+  };
 }
 
-module.exports = { createMqttManager };
+module.exports = {
+  createMqttManager,
+};
