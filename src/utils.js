@@ -2,14 +2,17 @@
 
 /**
  * @module utils
- * @description Pure utility helpers shared across Kaisha's internal modules.
+ * @description Shared utility functions used across all Kaisha modules.
  *
- * All functions are side-effect-free unless explicitly documented otherwise.
- * No module-level state is maintained.
+ * Every function in this module is a pure helper with no side-effects and no
+ * external dependencies.  All modules import from here — do NOT introduce
+ * imports that create circular dependencies.
  */
 
+// ── Async ─────────────────────────────────────────────────────────────────────
+
 /**
- * Pauses execution for the given number of milliseconds.
+ * Returns a Promise that resolves after `ms` milliseconds.
  *
  * @param {number} ms
  * @returns {Promise<void>}
@@ -18,9 +21,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ── Random ────────────────────────────────────────────────────────────────────
+
 /**
- * Returns a random integer in the closed interval [min, max].
- * Not suitable for cryptographic use.
+ * Returns a random integer in the range [min, max] (both inclusive).
  *
  * @param {number} min
  * @param {number} max
@@ -31,177 +35,202 @@ function randomInt(min, max) {
 }
 
 /**
- * Generates a random alphanumeric string of the requested length.
- * Uses pre-allocated arrays to avoid O(n²) string concatenation.
+ * Returns a random alphanumeric string of the given length.
+ * Suitable for client identifiers and nonces; not for secrets.
  *
  * @param {number} length
  * @returns {string}
  */
 function randomString(length) {
-  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-  const codes = new Uint8Array(length);
+  const chars =
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
   for (let i = 0; i < length; i++) {
-    codes[i] = chars.charCodeAt(Math.floor(Math.random() * chars.length));
+    result += chars.charAt(Math.floor(Math.random() * chars.length));
   }
-  return String.fromCharCode(...codes);
+  return result;
 }
 
+// ── String ────────────────────────────────────────────────────────────────────
+
 /**
- * Parses an array of raw `Set-Cookie` header strings into a name→value map.
- * Cookie attributes (Path, Domain, Secure, HttpOnly, etc.) are discarded.
+ * Extracts the substring of `str` that lies between the first occurrence of
+ * `startStr` and the next occurrence of `endStr` after it.
+ * Returns `null` when either delimiter cannot be found.
  *
- * Uses `Object.create(null)` to produce a prototype-free map so that
- * crafted cookie names such as `__proto__` cannot pollute the prototype chain.
- *
- * @param {string[]} cookieHeaders
- * @returns {Record<string, string>}
+ * @param {string} str
+ * @param {string} startStr
+ * @param {string} endStr
+ * @returns {string | null}
  */
-function parseCookies(cookieHeaders) {
-  const jar = Object.create(null);
-  for (const header of cookieHeaders) {
-    const end = header.indexOf(';');
-    const pair = end === -1 ? header : header.slice(0, end);
-    const eq = pair.indexOf('=');
-    if (eq === -1) continue;
-    const name = pair.slice(0, eq).trim();
-    const value = pair.slice(eq + 1).trim();
-    if (name) jar[name] = value;
+function between(str, startStr, endStr) {
+  if (typeof str !== 'string') return null;
+
+  const s = str.indexOf(startStr);
+  if (s === -1) return null;
+
+  const from = s + startStr.length;
+  const e = str.indexOf(endStr, from);
+  if (e === -1) return null;
+
+  return str.slice(from, e);
+}
+
+// ── JSON ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Attempts to parse `str` as JSON.
+ * Returns the parsed value on success, `null` on any error.
+ *
+ * @param {string} str
+ * @returns {object | null}
+ */
+function tryParseJSON(str) {
+  if (typeof str !== 'string') return null;
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
   }
-  return jar;
 }
 
-/**
- * Serialises a cookie map into a single `Cookie` request header value.
- *
- * @param {Record<string, string>} cookieMap
- * @returns {string}
- */
-function serializeCookies(cookieMap) {
-  const entries = Object.entries(cookieMap);
-  if (entries.length === 0) return '';
-  return entries.map(([k, v]) => `${k}=${v}`).join('; ');
-}
+// ── Object ────────────────────────────────────────────────────────────────────
 
 /**
- * Deeply merges `sources` into `target` (mutates target).
+ * Deep-merges `source` into `target` and returns a new object.
+ * Arrays in `source` replace arrays in `target` (no concatenation).
+ * Only plain objects are merged recursively; all other types are replaced.
  *
- * - Plain objects are merged recursively.
- * - Arrays and primitives in a source overwrite the corresponding target value.
- * - `null` source values overwrite target values.
- * - `undefined` source values are skipped (target value is preserved).
- *
- * @param {object}    target
- * @param {...object} sources
- * @returns {object}
+ * @param {Record<string, unknown>} target
+ * @param {Record<string, unknown>} source
+ * @returns {Record<string, unknown>}
  */
-function deepMerge(target, ...sources) {
-  for (const source of sources) {
-    if (source === null || typeof source !== 'object') continue;
-    for (const key of Object.keys(source)) {
-      const sv = source[key];
-      if (sv === undefined) continue;
-      if (
-        sv !== null &&
-        typeof sv === 'object' &&
-        !Array.isArray(sv) &&
-        typeof target[key] === 'object' &&
-        target[key] !== null &&
-        !Array.isArray(target[key])
-      ) {
-        deepMerge(target[key], sv);
-      } else {
-        target[key] = sv;
-      }
+function deepMerge(target, source) {
+  const result = Object.assign({}, target);
+
+  for (const key of Object.keys(source)) {
+    const sv = source[key];
+    const tv = result[key];
+
+    const bothPlainObjects =
+      sv !== null &&
+      sv !== undefined &&
+      typeof sv === 'object' &&
+      !Array.isArray(sv) &&
+      tv !== null &&
+      tv !== undefined &&
+      typeof tv === 'object' &&
+      !Array.isArray(tv);
+
+    if (bothPlainObjects) {
+      result[key] = deepMerge(
+        /** @type {Record<string, unknown>} */ (tv),
+        /** @type {Record<string, unknown>} */ (sv)
+      );
+    } else if (sv !== undefined) {
+      result[key] = sv;
     }
   }
-  return target;
+
+  return result;
 }
 
+// ── HTTP / Cookies ────────────────────────────────────────────────────────────
+
 /**
- * Parses a JSON string, returning `fallback` on any error.
+ * Serialises a cookie jar into the string format for the HTTP Cookie header.
+ * Entries with undefined or null values are omitted.
  *
- * @template T
- * @param {string} raw
- * @param {T}      [fallback=null]
- * @returns {T|null}
+ * @param {Record<string, string>} jar
+ * @returns {string}
  */
-function tryParseJSON(raw, fallback = null) {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return fallback;
-  }
+function serializeCookies(jar) {
+  return Object.entries(jar)
+    .filter(([, value]) => value !== undefined && value !== null)
+    .map(([key, value]) => `${key}=${value}`)
+    .join('; ');
 }
 
 /**
- * Converts a plain object into a `application/x-www-form-urlencoded` string.
+ * Parses an array of raw Set-Cookie header strings into a plain object
+ * mapping cookie names to their values.  Directive attributes (Path, Domain,
+ * Expires, Secure, HttpOnly, SameSite) are ignored.
  *
- * @param {Record<string, string|number|boolean>} params
+ * @param {string[]} setCookieHeaders
+ * @returns {Record<string, string>}
+ */
+function parseCookies(setCookieHeaders) {
+  const result = Object.create(null);
+
+  for (const header of setCookieHeaders) {
+    if (typeof header !== 'string') continue;
+
+    const parts = header.split(';');
+    const namePart = parts[0].trim();
+    const eqIdx = namePart.indexOf('=');
+    if (eqIdx === -1) continue;
+
+    const name = namePart.slice(0, eqIdx).trim();
+    const value = namePart.slice(eqIdx + 1);
+
+    if (name) {
+      result[name] = value;
+    }
+  }
+
+  return result;
+}
+
+// ── Backoff ───────────────────────────────────────────────────────────────────
+
+/**
+ * Computes an exponential-backoff delay with optional random jitter.
+ *
+ * Formula: min(base * 2^(attempt-1) + randomJitter, max)
+ *
+ * @param {number} attempt     - 1-based attempt number.
+ * @param {number} [base=1000]  - Base delay in milliseconds.
+ * @param {number} [max=30000]  - Maximum delay ceiling in milliseconds.
+ * @param {number} [jitter=0]   - Upper bound for random jitter in milliseconds.
+ * @returns {number}
+ */
+function exponentialBackoff(attempt, base = 1_000, max = 30_000, jitter = 0) {
+  const exp = base * Math.pow(2, attempt - 1);
+  const jitterValue = jitter > 0 ? Math.floor(Math.random() * jitter) : 0;
+  return Math.min(exp + jitterValue, max);
+}
+
+// ── Query string ──────────────────────────────────────────────────────────────
+
+/**
+ * Converts a plain object into a URL-encoded query / form-body string.
+ * Entries with undefined or null values are omitted.
+ * All other values are coerced to strings before encoding.
+ *
+ * @param {Record<string, unknown>} params
  * @returns {string}
  */
 function toQueryString(params) {
-  return Object.entries(params)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join('&');
-}
-
-/**
- * Returns the substring between `start` and `end` in `str`.
- * Returns `null` when either delimiter is absent.
- *
- * @param {string} str
- * @param {string} start
- * @param {string} end
- * @returns {string|null}
- */
-function between(str, start, end) {
-  const si = str.indexOf(start);
-  if (si === -1) return null;
-  const from = si + start.length;
-  const ei = str.indexOf(end, from);
-  if (ei === -1) return null;
-  return str.slice(from, ei);
-}
-
-/**
- * Races `promise` against a timeout, rejecting with a descriptive `Error`
- * when the timeout expires first.
- *
- * @param {Promise<unknown>} promise
- * @param {number}           ms
- * @returns {Promise<unknown>}
- */
-function withTimeout(promise, ms) {
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
+  const entries = Object.entries(params).filter(
+    ([, v]) => v !== undefined && v !== null
   );
-  return Promise.race([promise, timeout]);
+
+  return new URLSearchParams(
+    entries.map(([k, v]) => [k, String(v)])
+  ).toString();
 }
 
-/**
- * Computes an exponential-backoff delay with additive random jitter.
- *
- * @param {number} attempt    - 1-based attempt number.
- * @param {number} baseMs     - Base delay in milliseconds.
- * @param {number} [maxMs=30000]
- * @param {number} [jitterMs=500]
- * @returns {number}
- */
-function exponentialBackoff(attempt, baseMs, maxMs = 30_000, jitterMs = 500) {
-  const delay = Math.min(baseMs * 2 ** (attempt - 1), maxMs);
-  return delay + randomInt(0, jitterMs);
-}
+// ── Exports ───────────────────────────────────────────────────────────────────
 
 module.exports = {
   sleep,
   randomInt,
   randomString,
-  parseCookies,
-  serializeCookies,
-  deepMerge,
-  tryParseJSON,
-  toQueryString,
   between,
-  withTimeout,
+  tryParseJSON,
+  deepMerge,
+  serializeCookies,
+  parseCookies,
   exponentialBackoff,
+  toQueryString,
 };
