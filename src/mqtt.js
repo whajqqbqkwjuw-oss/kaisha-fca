@@ -23,7 +23,7 @@
  */
 
 const WebSocket = require('ws');
-const { sleep, randomInt } = require('./utils');
+const { sleep, randomInt, toQueryString } = require('./utils');
 
 const MQTT_HOST = 'wss://edge-chat.messenger.com/chat';
 
@@ -36,6 +36,7 @@ const MQTT_HANDSHAKE_CLOSE_CODE = 1002;
  */
 const CONNECT_PACKET_TYPE   = 0x10;
 const SUBSCRIBE_PACKET_TYPE = 0x82;
+const PUBLISH_QOS1_PACKET_TYPE = 0x32;
 const PINGREQ_PACKET_TYPE   = 0xC0;
 
 /*
@@ -417,6 +418,69 @@ function buildSubscribePacket(subscriptions, packetID) {
 }
 
 /**
+ * Builds a MQTT PUBLISH packet with QoS 1. Messenger's sync queue endpoints
+ * require a QoS-1 publish so the broker acknowledges receipt.
+ *
+ * @param {string} topic
+ * @param {Buffer|string} payload
+ * @param {number} packetID
+ * @returns {Buffer}
+ */
+function buildPublishPacket(topic, payload, packetID) {
+  const topicBuffer = encodeMqttString(topic);
+  const id = Buffer.allocUnsafe(2);
+  id.writeUInt16BE(packetID & 0xffff, 0);
+  const bodyPayload = Buffer.isBuffer(payload)
+    ? payload
+    : Buffer.from(String(payload ?? ''), 'utf8');
+  const body = Buffer.concat([topicBuffer, id, bodyPayload]);
+
+  return Buffer.concat([
+    Buffer.from([PUBLISH_QOS1_PACKET_TYPE]),
+    encodeRemainingLength(body.length),
+    body,
+  ]);
+}
+
+/**
+ * Builds the Messenger sync queue request.
+ *
+ * @param {string} userID
+ * @param {number|string} sequenceID
+ * @param {string|null} syncToken
+ * @returns {{ topic: string, payload: string }}
+ */
+function buildSyncQueueRequest(userID, sequenceID, syncToken) {
+  const payload = {
+    sync_api_version: 10,
+    max_deltas_able_to_process: 1000,
+    delta_batch_size: 500,
+    encoding: 'JSON',
+    entity_fbid: String(userID),
+  };
+
+  if (syncToken) {
+    return {
+      topic: '/messenger_sync_get_diffs',
+      payload: JSON.stringify({
+        ...payload,
+        last_seq_id: String(sequenceID),
+        sync_token: String(syncToken),
+      }),
+    };
+  }
+
+  return {
+    topic: '/messenger_sync_create_queue',
+    payload: JSON.stringify({
+      ...payload,
+      initial_titan_sequence_id: String(sequenceID),
+      device_params: null,
+    }),
+  };
+}
+
+/**
  * Builds a MQTT PINGREQ packet.
  *
  * @returns {Buffer}
@@ -504,6 +568,7 @@ function createMqttManager(
   {
     maxReconnectAttempts = 10,
     reconnectBaseDelay   = 2_000,
+    httpClient            = null,
   } = {}
 ) {
   /*
@@ -522,6 +587,9 @@ function createMqttManager(
   let sessionReady        = false;
 
   let packetIDCounter = 1;
+  let syncSequenceID = null;
+  let syncToken = null;
+  let syncQueuePromise = null;
 
   /*
    * MQTT packets can arrive split across WebSocket frames or multiple packets
@@ -605,6 +673,148 @@ function createMqttManager(
     }, (MQTT_KEEPALIVE / 2) * 1000);
 
     if (typeof pingInterval.unref === 'function') pingInterval.unref();
+  }
+
+  // ── Messenger sync queue ────────────────────────────────────────────────────
+
+  function computeJazoest(dtsg) {
+    let sum = 0;
+    for (let i = 0; i < String(dtsg || '').length; i++) {
+      sum += String(dtsg).charCodeAt(i);
+    }
+    return `2${sum}`;
+  }
+
+  async function fetchInitialSequenceID() {
+    if (!httpClient) {
+      throw new Error('MQTT sync queue requires the authenticated HTTP client');
+    }
+
+    const dtsg = String(session?.data?.dtsg || '');
+    const userID = String(session?.data?.userID || '');
+    if (!dtsg || !userID) {
+      throw new Error('Missing session tokens required to fetch Messenger sync sequence ID');
+    }
+
+    const variables = {
+      limit: 0,
+      tags: ['INBOX'],
+      before: null,
+      includeDeliveryReceipts: false,
+      includeSeqID: true,
+    };
+
+    const body = toQueryString({
+      fb_dtsg: dtsg,
+      fb_dtsg_ag: session?.data?.fbDtsgAg || dtsg,
+      jazoest: computeJazoest(dtsg),
+      __user: userID,
+      __a: '1',
+      __req: 'a',
+      dpr: '1',
+      lsd: session?.data?.siteData || '',
+      doc_id: '1349387578499440',
+      variables: JSON.stringify(variables),
+    });
+
+    const response = await httpClient.post(
+      'https://www.facebook.com/api/graphql/',
+      body,
+      {
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          'x-fb-friendly-name': 'MessengerRequest',
+          'x-requested-with': 'XMLHttpRequest',
+          referer: 'https://www.facebook.com/',
+          origin: 'https://www.facebook.com',
+        },
+      }
+    );
+
+    const raw = typeof response.data === 'string'
+      ? response.data
+      : JSON.stringify(response.data);
+
+    const line = raw.split('\n').find((value) => value.trim().startsWith('{'));
+    if (!line) throw new Error('Messenger sequence response contained no JSON object');
+
+    const parsed = JSON.parse(line);
+    const sequenceID =
+      parsed?.data?.viewer?.message_threads?.sync_sequence_id ??
+      parsed?.viewer?.message_threads?.sync_sequence_id;
+
+    if (sequenceID === undefined || sequenceID === null || sequenceID === '') {
+      throw new Error('Messenger sync_sequence_id was not present in the response');
+    }
+
+    syncSequenceID = String(sequenceID);
+    logger.debug(`Messenger sync sequence initialized: ${syncSequenceID}`);
+    return syncSequenceID;
+  }
+
+  function publishPacket(topic, payload, qos = 1) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || !sessionReady) {
+      throw new Error(`Cannot publish MQTT topic ${topic}: session is not ready`);
+    }
+
+    if (qos !== 1) {
+      throw new Error('Kaisha MQTT publisher currently supports QoS 1 only');
+    }
+
+    const packetID = packetIDCounter++;
+    if (packetIDCounter > 0xffff) packetIDCounter = 1;
+
+    const packet = buildPublishPacket(topic, payload, packetID);
+    ws.send(packet);
+    logger.debug(`MQTT PUBLISH TX topic=${topic}, qos=1, packetID=${packetID}, payload=${Buffer.byteLength(payload)} bytes`);
+    return packetID;
+  }
+
+  async function ensureSyncQueue() {
+    if (syncQueuePromise) return syncQueuePromise;
+
+    syncQueuePromise = (async () => {
+      if (syncSequenceID === null) {
+        await fetchInitialSequenceID();
+      }
+
+      const request = buildSyncQueueRequest(
+        session.data.userID,
+        syncSequenceID,
+        syncToken
+      );
+
+      publishPacket(request.topic, request.payload, 1);
+      logger.info(`Messenger sync queue requested via ${request.topic}`);
+    })().catch((err) => {
+      logger.error(`Failed to initialize Messenger sync queue: ${err.message}`);
+      if (onErrorCallback) onErrorCallback(err);
+      throw err;
+    }).finally(() => {
+      syncQueuePromise = null;
+    });
+
+    return syncQueuePromise;
+  }
+
+  function updateSyncStateFromTms(payload) {
+    try {
+      const text = payload.toString('utf8');
+      const parsed = JSON.parse(text);
+
+      if (parsed && parsed.syncToken && parsed.firstDeltaSeqId !== undefined) {
+        syncToken = String(parsed.syncToken);
+        syncSequenceID = String(parsed.firstDeltaSeqId);
+        logger.debug('Messenger sync token initialized from /t_ms');
+        return;
+      }
+
+      if (parsed && parsed.lastIssuedSeqId !== undefined) {
+        syncSequenceID = String(parsed.lastIssuedSeqId);
+      }
+    } catch {
+      // Listener/parser owns event decoding; sync metadata is best-effort here.
+    }
   }
 
   // ── Subscribe ───────────────────────────────────────────────────────────────
@@ -709,6 +919,7 @@ function createMqttManager(
 
     startPing();
     subscribeToTopics();
+    void ensureSyncQueue();
 
     if (onConnectCallback) {
       try {
@@ -763,6 +974,10 @@ function createMqttManager(
 
     logger.debug(`MQTT PUBLISH topic=${topic}, payload=${payload.length} bytes`);
 
+    if (topic === '/t_ms') {
+      updateSyncStateFromTms(payload);
+    }
+
     dispatch(topic, payload);
   }
 
@@ -807,6 +1022,14 @@ function createMqttManager(
 
       case 3:  // PUBLISH
         handlePublish(buffer, remaining);
+        break;
+
+      case 4:  // PUBACK
+        if (remaining.value >= 2 && remaining.offset + 2 <= buffer.length) {
+          logger.debug(`MQTT PUBACK received packetID=${buffer.readUInt16BE(remaining.offset)}`);
+        } else {
+          logger.debug('MQTT PUBACK received');
+        }
         break;
 
       case 9:  // SUBACK
@@ -1209,6 +1432,8 @@ module.exports = {
   _encodeMqttString:      encodeMqttString,
   _buildConnectPacket:    buildConnectPacket,
   _buildSubscribePacket:  buildSubscribePacket,
+  _buildPublishPacket:    buildPublishPacket,
+  _buildSyncQueueRequest: buildSyncQueueRequest,
   _buildPingPacket:       buildPingPacket,
   _parseConnack:          parseConnack,
   _decodeCookieValue:     decodeCookieValue,
