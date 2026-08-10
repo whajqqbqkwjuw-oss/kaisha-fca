@@ -28,7 +28,6 @@
  */
 
 const { tryParseJSON } = require('./utils');
-const zlib = require('zlib');
 
 // ─── Payload decoder ─────────────────────────────────────────────────────────
 
@@ -39,66 +38,15 @@ const zlib = require('zlib');
  * @returns {object|null}
  */
 function decodePayload(payload) {
-  if (!Buffer.isBuffer(payload)) {
-    payload = Buffer.from(payload ?? '');
-  }
+  const raw    = payload.toString('utf8');
+  const direct = tryParseJSON(raw);
+  if (direct) return direct;
 
-  const candidates = [payload];
-
-  // Messenger realtime payloads can arrive compressed depending on the
-  // transport/session. Try the common zlib formats before giving up.
-  for (const fn of [zlib.gunzipSync, zlib.inflateSync, zlib.inflateRawSync, zlib.brotliDecompressSync]) {
-    try {
-      const decoded = fn(payload);
-      if (decoded && decoded.length) candidates.push(decoded);
-    } catch {}
-  }
-
-  for (const candidate of candidates) {
-    const raw = candidate.toString('utf8').replace(/^\uFEFF/, '').trim();
-    if (!raw) continue;
-
-    const variants = [
-      raw,
-      raw.replace(/^\d+/, '').trim(),
-    ];
-
-    for (const variant of variants) {
-      const parsed = tryParseJSON(variant);
-      if (parsed) return parsed;
-
-      // Some payloads are wrapped as a JSON string containing JSON.
-      const quoted = tryParseJSON(variant);
-      if (typeof quoted === 'string') {
-        const nested = tryParseJSON(quoted);
-        if (nested) return nested;
-      }
-    }
-  }
-
-  return null;
+  const trimmed = raw.replace(/^\d+/, '').trim();
+  return tryParseJSON(trimmed);
 }
 
 // ─── /t_ms delta routing ─────────────────────────────────────────────────────
-
-function extractDeltas(data) {
-  if (Array.isArray(data)) return data;
-  if (!data || typeof data !== 'object') return [];
-
-  if (Array.isArray(data.deltas)) return data.deltas;
-  if (data.delta && typeof data.delta === 'object') return [data.delta];
-
-  // Be tolerant of common Messenger wrappers.
-  for (const key of ['data', 'payload', 'result']) {
-    const nested = data[key];
-    if (nested && typeof nested === 'object') {
-      const found = extractDeltas(nested);
-      if (found.length) return found;
-    }
-  }
-
-  return [data];
-}
 
 /**
  * Parses a raw /t_ms MQTT payload and returns the first recognisable event.
@@ -111,7 +59,7 @@ function parseMqttPayload(payload, selfUserID) {
   const data = decodePayload(payload);
   if (!data) return null;
 
-  const deltas = extractDeltas(data);
+  const deltas = data.deltas ?? (data.delta ? [data.delta] : []);
 
   for (const delta of deltas) {
     const parsed = parseDelta(delta, selfUserID);
@@ -889,20 +837,14 @@ function attachListener(mqttManager, emitter, selfUserID, logger) {
   mqttManager.on('/t_ms', (payload) => {
     try {
       const data = decodePayload(payload);
-      if (!data) {
-        logger.warn(`Received /t_ms payload but could not decode it (${payload.length} bytes)`);
-        logger.debug(`Undecoded /t_ms prefix: ${payload.subarray(0, 96).toString('hex')}`);
-        return;
-      }
+      if (!data) return;
 
-      const deltas = extractDeltas(data);
-      let parsedCount = 0;
+      const deltas = data.deltas ?? (data.delta ? [data.delta] : [data]);
 
       for (const delta of deltas) {
         const event = parseDelta(delta, selfUserID);
         if (!event) continue;
 
-        parsedCount++;
         logger.debug(`Parsed MQTT event: ${event.type}`);
 
         switch (event.type) {
@@ -1000,10 +942,6 @@ function attachListener(mqttManager, emitter, selfUserID, logger) {
             emitter.emit('call', event);
             break;
         }
-      }
-
-      if (parsedCount === 0) {
-        logger.debug(`Received /t_ms payload (${payload.length} bytes) but no supported event delta was recognized`);
       }
     } catch (err) {
       logger.error('Error parsing /t_ms payload:', err.message);
