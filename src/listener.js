@@ -38,12 +38,31 @@ const { tryParseJSON } = require('./utils');
  * @returns {object|null}
  */
 function decodePayload(payload) {
-  const raw    = payload.toString('utf8');
-  const direct = tryParseJSON(raw);
-  if (direct) return direct;
+  if (!Buffer.isBuffer(payload)) payload = Buffer.from(payload ?? '');
 
-  const trimmed = raw.replace(/^\d+/, '').trim();
-  return tryParseJSON(trimmed);
+  const raw = payload.toString('utf8').replace(/^\uFEFF/, '').trim();
+  if (!raw) return null;
+
+  const candidates = [
+    raw,
+    raw.replace(/^\d+/, '').trim(),
+    raw.replace(/^for\s*\(;;\);?/, '').trim(),
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = tryParseJSON(candidate);
+    if (parsed !== null) return parsed;
+  }
+
+  for (const candidate of candidates) {
+    const outer = tryParseJSON(candidate);
+    if (typeof outer === 'string') {
+      const inner = tryParseJSON(outer);
+      if (inner !== null) return inner;
+    }
+  }
+
+  return null;
 }
 
 // ─── /t_ms delta routing ─────────────────────────────────────────────────────
@@ -59,14 +78,27 @@ function parseMqttPayload(payload, selfUserID) {
   const data = decodePayload(payload);
   if (!data) return null;
 
-  const deltas = data.deltas ?? (data.delta ? [data.delta] : []);
+  let deltas;
+  if (Array.isArray(data)) {
+    deltas = data;
+  } else if (Array.isArray(data.deltas)) {
+    deltas = data.deltas;
+  } else if (data.delta) {
+    deltas = Array.isArray(data.delta) ? data.delta : [data.delta];
+  } else if (Array.isArray(data.data?.deltas)) {
+    deltas = data.data.deltas;
+  } else if (data.data?.delta) {
+    deltas = Array.isArray(data.data.delta) ? data.data.delta : [data.data.delta];
+  } else {
+    deltas = [data];
+  }
 
   for (const delta of deltas) {
     const parsed = parseDelta(delta, selfUserID);
     if (parsed) return parsed;
   }
 
-  return parseDelta(data, selfUserID);
+  return null;
 }
 
 /**
@@ -837,13 +869,37 @@ function attachListener(mqttManager, emitter, selfUserID, logger) {
   mqttManager.on('/t_ms', (payload) => {
     try {
       const data = decodePayload(payload);
-      if (!data) return;
+      if (!data) {
+        logger.debug(`/t_ms payload was not valid JSON (${payload.length} bytes)`);
+        return;
+      }
 
-      const deltas = data.deltas ?? (data.delta ? [data.delta] : [data]);
+      let deltas;
+      if (Array.isArray(data)) {
+        deltas = data;
+      } else if (Array.isArray(data.deltas)) {
+        deltas = data.deltas;
+      } else if (data.delta) {
+        deltas = Array.isArray(data.delta) ? data.delta : [data.delta];
+      } else if (Array.isArray(data.data?.deltas)) {
+        deltas = data.data.deltas;
+      } else if (data.data?.delta) {
+        deltas = Array.isArray(data.data.delta) ? data.data.delta : [data.data.delta];
+      } else {
+        deltas = [data];
+      }
+
+      logger.debug(`/t_ms decoded ${deltas.length} delta(s)`);
 
       for (const delta of deltas) {
         const event = parseDelta(delta, selfUserID);
-        if (!event) continue;
+        if (!event) {
+          const cls = delta && typeof delta === 'object'
+            ? String(delta.class ?? delta.type ?? 'unknown')
+            : typeof delta;
+          logger.debug(`/t_ms delta ignored: class=${cls}`);
+          continue;
+        }
 
         logger.debug(`Parsed MQTT event: ${event.type}`);
 
