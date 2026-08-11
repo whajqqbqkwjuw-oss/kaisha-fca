@@ -2,271 +2,742 @@
 
 /**
  * @module login
- * @description Handles email/password and appstate-based authentication
- * against Facebook, producing a fully hydrated Session.
+ * @description
+ * Facebook authentication and appstate session hydration.
  *
- * Root-cause fix (CONNACK 5):
- *   The MQTT broker at edge-chat.messenger.com authenticates against
- *   messenger.com session cookies, not just facebook.com cookies.
- *   After obtaining facebook.com tokens, we now also GET messenger.com
- *   so that the HTTP client cookie jar is populated with the
- *   messenger-specific cookies the broker requires.
- *   Without this step the WebSocket Cookie header is missing those cookies
- *   and the broker returns CONNACK returnCode=5 (Not Authorized).
+ * The login flow is intentionally strict:
+ *
+ * 1. Load the supplied Facebook appstate.
+ * 2. Verify the Facebook session with facebook.com.
+ * 3. Refresh the authenticated Facebook cookie jar.
+ * 4. Visit messenger.com using the same authenticated HTTP client.
+ * 5. Preserve the complete cookie jar for the MQTT layer.
+ * 6. Refuse to create an MQTT session when the Facebook session is invalid.
  */
 
 const { between, randomString } = require('./utils');
 const { createSession, loadFromAppState } = require('./session');
 
-const FB_BASE_URL       = 'https://www.facebook.com';
-const FB_LOGIN_URL      = `${FB_BASE_URL}/login/device-based/regular/login/`;
-const FB_HOME_URL       = `${FB_BASE_URL}/`;
+const FB_BASE_URL = 'https://www.facebook.com';
+const FB_HOME_URL = `${FB_BASE_URL}/`;
+const FB_LOGIN_URL =
+  `${FB_BASE_URL}/login/device-based/regular/login/`;
 
-/**
- * Messenger home page.
- *
- * Fetching this URL while carrying valid facebook.com session cookies causes
- * Facebook's auth layer to set messenger-domain session cookies.  The MQTT
- * broker at edge-chat.messenger.com validates those cookies; they must be
- * present in the WebSocket Cookie header or the broker returns CONNACK 5.
- */
-const MESSENGER_HOME_URL = 'https://www.messenger.com/';
+const MESSENGER_HOME_URL =
+  'https://www.messenger.com/';
 
-/**
- * Extracts key metadata from a Facebook HTML page source needed to
- * construct authenticated API requests.
- *
- * @param {string} html - Raw HTML of a logged-in Facebook page.
- * @returns {{ dtsg: string, fbDtsgAg: string, userID: string, siteData: string }}
- * @throws {Error} if any required token cannot be located in the page.
- */
+/* -------------------------------------------------------------------------- */
+/* Page token extraction                                                      */
+/* -------------------------------------------------------------------------- */
+
 function extractPageTokens(html) {
-  const dtsg =
-    between(html, '"DTSGInitialData",[],{"token":"', '"') ||
-    between(html, '"token":"', '"') ||
-    between(html, 'dtsg":{"token":"', '"');
+  if (
+    typeof html !== 'string' ||
+    html.length === 0
+  ) {
+    throw new Error(
+      'Facebook returned an empty page while extracting authentication tokens'
+    );
+  }
 
-  if (!dtsg) throw new Error('Unable to extract DTSG token from page HTML');
+  const dtsg =
+    between(
+      html,
+      '"DTSGInitialData",[],{"token":"',
+      '"'
+    ) ||
+    between(
+      html,
+      '"token":"',
+      '"'
+    ) ||
+    between(
+      html,
+      'dtsg":{"token":"',
+      '"'
+    );
+
+  if (!dtsg) {
+    throw new Error(
+      'Unable to extract DTSG token from Facebook page. ' +
+      'The appstate may be expired, invalid, or Facebook may have returned a checkpoint page.'
+    );
+  }
 
   const fbDtsgAg =
-    between(html, '"dtsgag":"', '"') ||
-    between(html, '"fb_dtsg_ag":"', '"') ||
+    between(
+      html,
+      '"dtsgag":"',
+      '"'
+    ) ||
+    between(
+      html,
+      '"fb_dtsg_ag":"',
+      '"'
+    ) ||
     dtsg;
 
   const userID =
-    between(html, '"USER_ID":"', '"') ||
-    between(html, '"viewerID":"', '"') ||
-    between(html, '"user_id":"', '"');
+    between(
+      html,
+      '"USER_ID":"',
+      '"'
+    ) ||
+    between(
+      html,
+      '"viewerID":"',
+      '"'
+    ) ||
+    between(
+      html,
+      '"user_id":"',
+      '"'
+    );
 
-  if (!userID) throw new Error('Unable to extract user ID from page HTML');
+  if (!userID) {
+    throw new Error(
+      'Unable to extract Facebook user ID from authenticated page'
+    );
+  }
 
   const siteData =
-    between(html, '"LSD",[],{"token":"', '"') ||
-    between(html, '"lsd":{"token":"', '"') ||
+    between(
+      html,
+      '"LSD",[],{"token":"',
+      '"'
+    ) ||
+    between(
+      html,
+      '"lsd":{"token":"',
+      '"'
+    ) ||
     '';
 
-  return { dtsg, fbDtsgAg, userID, siteData };
+  return {
+    dtsg,
+    fbDtsgAg,
+    userID,
+    siteData,
+  };
 }
 
-/**
- * Extracts the initial form tokens from the Facebook login page HTML.
- *
- * @param {string} html
- * @returns {{ lsd: string, jazoest: string, mTs: string }}
- */
+/* -------------------------------------------------------------------------- */
+/* Login form tokens                                                          */
+/* -------------------------------------------------------------------------- */
+
 function extractLoginFormTokens(html) {
-  const lsd     = between(html, 'name="lsd" value="', '"')     || '';
-  const jazoest = between(html, 'name="jazoest" value="', '"') || '';
-  const mTs     = between(html, 'name="m_ts" value="', '"')    || '';
-  return { lsd, jazoest, mTs };
-}
+  const lsd =
+    between(
+      html,
+      'name="lsd" value="',
+      '"'
+    ) || '';
 
-/**
- * Fetches the Messenger home page so that messenger.com session cookies are
- * added to the HTTP client cookie jar.
- *
- * The MQTT broker at edge-chat.messenger.com validates these cookies when it
- * receives the MQTT CONNECT packet.  Without them the broker returns
- * CONNACK returnCode=5 (Not Authorized) even when facebook.com auth succeeds.
- *
- * Errors are caught and logged as warnings so the rest of the login flow
- * can continue.
- *
- * @param {import('./http').HttpClient} httpClient
- * @param {import('./logger').Logger} logger
- */
-async function hydrateMessengerCookies(httpClient, logger) {
-  logger.debug('Fetching messenger.com to hydrate MQTT session cookies…');
-  try {
-    const res = await httpClient.get(MESSENGER_HOME_URL, {
-      headers: {
-        referer:          FB_HOME_URL,
-        'sec-fetch-site': 'cross-site',
-        'sec-fetch-dest': 'document',
-        'sec-fetch-mode': 'navigate',
-      },
-    });
+  const jazoest =
+    between(
+      html,
+      'name="jazoest" value="',
+      '"'
+    ) || '';
 
-    if (res.status >= 400) {
-      logger.warn(
-        `messenger.com returned HTTP ${res.status} — ` +
-        'MQTT broker may still reject CONNECT if session cookies are absent'
-      );
-    } else {
-      logger.debug('messenger.com session cookies obtained');
-    }
-  } catch (err) {
-    logger.warn(
-      `messenger.com prefetch failed (non-fatal): ${err.message}. ` +
-      'MQTT broker may reject CONNECT if messenger-domain cookies are absent.'
-    );
-  }
-}
+  const mTs =
+    between(
+      html,
+      'name="m_ts" value="',
+      '"'
+    ) || '';
 
-/**
- * Authenticates with Facebook using an email address and password.
- *
- * @param {object} credentials
- * @param {string} credentials.email
- * @param {string} credentials.password
- * @param {import('./http').HttpClient} httpClient
- * @param {import('./logger').Logger} logger
- * @returns {Promise<import('./session').Session>}
- */
-async function loginWithCredentials({ email, password }, httpClient, logger) {
-  logger.info('Fetching Facebook login page…');
-
-  const loginPageRes = await httpClient.get(FB_BASE_URL, {
-    headers: { 'sec-fetch-dest': 'document' },
-  });
-
-  if (loginPageRes.status !== 200) {
-    throw new Error(`Failed to fetch login page (HTTP ${loginPageRes.status})`);
-  }
-
-  const { lsd, jazoest } = extractLoginFormTokens(loginPageRes.data);
-
-  logger.debug('Submitting login credentials…');
-
-  const formData = new URLSearchParams({
+  return {
     lsd,
     jazoest,
+    mTs,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Cookie helpers                                                             */
+/* -------------------------------------------------------------------------- */
+
+function hasCookie(
+  cookies,
+  name
+) {
+  return Boolean(
+    cookies &&
+    typeof cookies === 'object' &&
+    cookies[name]
+  );
+}
+
+function countCookies(cookies) {
+  if (
+    !cookies ||
+    typeof cookies !== 'object'
+  ) {
+    return 0;
+  }
+
+  return Object.keys(cookies).length;
+}
+
+function assertFacebookSession(
+  cookies
+) {
+  if (
+    !hasCookie(
+      cookies,
+      'c_user'
+    )
+  ) {
+    throw new Error(
+      'Facebook session is not authenticated: c_user cookie is missing'
+    );
+  }
+
+  if (
+    !hasCookie(
+      cookies,
+      'xs'
+    )
+  ) {
+    throw new Error(
+      'Facebook session is incomplete: xs cookie is missing'
+    );
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Messenger hydration                                                       */
+/* -------------------------------------------------------------------------- */
+
+async function hydrateMessengerCookies(
+  httpClient,
+  logger
+) {
+  logger.debug(
+    'Hydrating Messenger session from messenger.com…'
+  );
+
+  const before =
+    httpClient.getCookies();
+
+  const beforeCount =
+    countCookies(before);
+
+  let response;
+
+  try {
+    response =
+      await httpClient.get(
+        MESSENGER_HOME_URL,
+        {
+          headers: {
+            referer:
+              FB_HOME_URL,
+
+            origin:
+              FB_BASE_URL,
+
+            'sec-fetch-site':
+              'cross-site',
+
+            'sec-fetch-dest':
+              'document',
+
+            'sec-fetch-mode':
+              'navigate',
+
+            accept:
+              'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        }
+      );
+  } catch (err) {
+    throw new Error(
+      `Unable to initialize Messenger session: ${err.message}`
+    );
+  }
+
+  if (
+    !response ||
+    response.status >= 400
+  ) {
+    throw new Error(
+      `Messenger session initialization failed: HTTP ${response?.status ?? 'unknown'}`
+    );
+  }
+
+  const after =
+    httpClient.getCookies();
+
+  const afterCount =
+    countCookies(after);
+
+  const newCookies =
+    Object.keys(after).filter(
+      (name) =>
+        !Object.prototype.hasOwnProperty.call(
+          before,
+          name
+        )
+    );
+
+  logger.debug(
+    `Messenger session request completed (HTTP ${response.status})`
+  );
+
+  logger.debug(
+    `Cookie jar: ${beforeCount} → ${afterCount} cookies`
+  );
+
+  if (
+    newCookies.length > 0
+  ) {
+    logger.debug(
+      `New session cookies received: ${newCookies.length}`
+    );
+  } else {
+    logger.debug(
+      'Messenger did not add new cookie names; continuing with the refreshed authenticated cookie jar'
+    );
+  }
+
+  return after;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Email/password login                                                       */
+/* -------------------------------------------------------------------------- */
+
+async function loginWithCredentials(
+  {
     email,
-    pass:               password,
-    login:              '1',
-    default_persistent: '0',
-    timezone:           '420',
-    lgndim:             Buffer.from('{"w":1920,"h":1080,"aw":1920,"ah":1040,"c":24}').toString('base64'),
-    lgnrnd:             randomString(16).toUpperCase(),
-    lgnjs:              String(Math.floor(Date.now() / 1000)),
-    locale:             'en_US',
-  });
-
-  await httpClient.post(FB_LOGIN_URL, formData.toString(), {
-    headers: {
-      'content-type':  'application/x-www-form-urlencoded',
-      origin:          FB_BASE_URL,
-      referer:         FB_BASE_URL + '/',
-      'sec-fetch-dest': 'document',
-      'sec-fetch-mode': 'navigate',
-    },
-  });
-
-  const currentCookies = httpClient.getCookies();
-  if (!currentCookies['c_user']) {
+    password,
+  },
+  httpClient,
+  logger
+) {
+  if (!email) {
     throw new Error(
-      'Login failed: "c_user" cookie not set after login attempt. ' +
-      'Verify your credentials or check for checkpoint / 2FA challenges.'
+      'Email is required'
     );
   }
 
-  logger.info('Credentials accepted. Fetching home page for tokens…');
-
-  const homeRes = await httpClient.get(FB_HOME_URL, {
-    headers: { referer: FB_BASE_URL + '/' },
-  });
-
-  const { dtsg, fbDtsgAg, userID, siteData } = extractPageTokens(homeRes.data);
-
-  // Fetch messenger.com to get the messenger-domain cookies that the MQTT broker
-  // validates when it receives the CONNECT packet.
-  await hydrateMessengerCookies(httpClient, logger);
-
-  const session = createSession({
-    cookies:   httpClient.getCookies(),   // full jar: facebook.com + messenger.com
-    userID,
-    clientID:  randomString(20),
-    dtsg,
-    fbDtsgAg,
-    siteData,
-    createdAt: Date.now(),
-  });
-
-  logger.info(`Logged in as user ${userID}`);
-  return session;
-}
-
-/**
- * Authenticates using a pre-exported appstate cookie array, then fetches
- * the Facebook home page to hydrate the session with DTSG tokens, and
- * fetches the Messenger home page to obtain messenger-domain session cookies
- * required by the MQTT broker.
- *
- * @param {Array<{name:string, value:string}>} appstate
- * @param {import('./http').HttpClient} httpClient
- * @param {import('./logger').Logger} logger
- * @returns {Promise<import('./session').Session>}
- */
-async function loginWithAppState(appstate, httpClient, logger) {
-  logger.info('Logging in via appstate…');
-
-  const partialSession = loadFromAppState(appstate);
-  httpClient.setCookies(partialSession.data.cookies);
-
-  const homeRes = await httpClient.get(FB_HOME_URL, {
-    headers: { referer: FB_BASE_URL + '/' },
-  });
-
-  if (homeRes.status !== 200) {
-    throw new Error(`Failed to fetch home page (HTTP ${homeRes.status})`);
-  }
-
-  const fbCookies = httpClient.getCookies();
-  if (!fbCookies['c_user']) {
+  if (!password) {
     throw new Error(
-      'AppState login failed: "c_user" cookie missing. The appstate may be expired or invalid.'
+      'Password is required'
     );
   }
 
-  const { dtsg, fbDtsgAg, userID, siteData } = extractPageTokens(homeRes.data);
+  logger.info(
+    'Fetching Facebook login page…'
+  );
 
-  // ── Critical fix: fetch messenger.com for MQTT broker auth ───────────────
-  //
-  // The MQTT broker at edge-chat.messenger.com validates the WebSocket
-  // Cookie header against messenger.com session data.  These cookies are
-  // only set when the client visits messenger.com while holding valid
-  // facebook.com session cookies.
-  //
-  // Without this step the broker receives a Cookie header that contains
-  // only facebook.com cookies, which is insufficient, and it responds
-  // with CONNACK returnCode=5 (Not Authorized).
-  await hydrateMessengerCookies(httpClient, logger);
+  const loginPageRes =
+    await httpClient.get(
+      FB_BASE_URL,
+      {
+        headers: {
+          'sec-fetch-dest':
+            'document',
+        },
+      }
+    );
 
-  // Full cookie jar: original appstate + facebook.com refreshes + messenger.com cookies
-  const currentCookies = httpClient.getCookies();
+  if (
+    loginPageRes.status !==
+    200
+  ) {
+    throw new Error(
+      `Failed to fetch login page (HTTP ${loginPageRes.status})`
+    );
+  }
 
-  const session = createSession({
-    cookies:   currentCookies,
-    userID,
-    clientID:  randomString(20),
+  const {
+    lsd,
+    jazoest,
+  } =
+    extractLoginFormTokens(
+      loginPageRes.data
+    );
+
+  if (!lsd) {
+    throw new Error(
+      'Facebook login page did not provide an LSD token'
+    );
+  }
+
+  logger.debug(
+    'Submitting login credentials…'
+  );
+
+  const formData =
+    new URLSearchParams({
+      lsd,
+      jazoest,
+
+      email,
+
+      pass:
+        password,
+
+      login:
+        '1',
+
+      default_persistent:
+        '0',
+
+      timezone:
+        '420',
+
+      lgndim:
+        Buffer.from(
+          JSON.stringify({
+            w: 1920,
+            h: 1080,
+            aw: 1920,
+            ah: 1040,
+            c: 24,
+          })
+        ).toString(
+          'base64'
+        ),
+
+      lgnrnd:
+        randomString(
+          16
+        ).toUpperCase(),
+
+      lgnjs:
+        String(
+          Math.floor(
+            Date.now() / 1000
+          )
+        ),
+
+      locale:
+        'en_US',
+    });
+
+  const loginResponse =
+    await httpClient.post(
+      FB_LOGIN_URL,
+      formData.toString(),
+      {
+        headers: {
+          'content-type':
+            'application/x-www-form-urlencoded',
+
+          origin:
+            FB_BASE_URL,
+
+          referer:
+            `${FB_BASE_URL}/`,
+
+          'sec-fetch-dest':
+            'document',
+
+          'sec-fetch-mode':
+            'navigate',
+        },
+      }
+    );
+
+  if (
+    !loginResponse
+  ) {
+    throw new Error(
+      'Facebook login returned no response'
+    );
+  }
+
+  const cookiesAfterLogin =
+    httpClient.getCookies();
+
+  assertFacebookSession(
+    cookiesAfterLogin
+  );
+
+  logger.info(
+    'Facebook credentials accepted'
+  );
+
+  logger.debug(
+    `Authenticated cookie jar contains ${countCookies(cookiesAfterLogin)} cookies`
+  );
+
+  logger.info(
+    'Fetching Facebook home page for session tokens…'
+  );
+
+  const homeRes =
+    await httpClient.get(
+      FB_HOME_URL,
+      {
+        headers: {
+          referer:
+            `${FB_BASE_URL}/`,
+        },
+      }
+    );
+
+  if (
+    homeRes.status !==
+    200
+  ) {
+    throw new Error(
+      `Failed to fetch authenticated Facebook home page (HTTP ${homeRes.status})`
+    );
+  }
+
+  const {
     dtsg,
     fbDtsgAg,
+    userID,
     siteData,
-    createdAt: Date.now(),
-  });
+  } =
+    extractPageTokens(
+      homeRes.data
+    );
 
-  logger.info(`Logged in as user ${userID} via appstate`);
+  const refreshedCookies =
+    httpClient.getCookies();
+
+  assertFacebookSession(
+    refreshedCookies
+  );
+
+  await hydrateMessengerCookies(
+    httpClient,
+    logger
+  );
+
+  const currentCookies =
+    httpClient.getCookies();
+
+  assertFacebookSession(
+    currentCookies
+  );
+
+  const session =
+    createSession({
+      cookies:
+        currentCookies,
+
+      userID,
+
+      clientID:
+        randomString(
+          20
+        ),
+
+      dtsg,
+
+      fbDtsgAg,
+
+      siteData,
+
+      createdAt:
+        Date.now(),
+    });
+
+  logger.info(
+    `Logged in as user ${userID}`
+  );
+
+  logger.debug(
+    `Final authenticated cookie jar contains ${countCookies(currentCookies)} cookies`
+  );
+
   return session;
 }
 
-module.exports = { loginWithCredentials, loginWithAppState };
+/* -------------------------------------------------------------------------- */
+/* Appstate login                                                             */
+/* -------------------------------------------------------------------------- */
+
+async function loginWithAppState(
+  appstate,
+  httpClient,
+  logger
+) {
+  logger.info(
+    'Logging in via appstate…'
+  );
+
+  if (
+    !Array.isArray(
+      appstate
+    ) ||
+    appstate.length === 0
+  ) {
+    throw new Error(
+      'Appstate must be a non-empty cookie array'
+    );
+  }
+
+  /*
+   * Convert the supplied appstate into the internal session representation.
+   */
+  const partialSession =
+    loadFromAppState(
+      appstate
+    );
+
+  if (
+    !partialSession ||
+    !partialSession.data ||
+    !partialSession.data.cookies
+  ) {
+    throw new Error(
+      'Unable to construct a session from the supplied appstate'
+    );
+  }
+
+  httpClient.setCookies(
+    partialSession.data.cookies
+  );
+
+  const initialCookies =
+    httpClient.getCookies();
+
+  assertFacebookSession(
+    initialCookies
+  );
+
+  logger.debug(
+    `Loaded ${countCookies(initialCookies)} authentication cookies into HTTP client`
+  );
+
+  /*
+   * First request: Facebook.
+   *
+   * This validates that the supplied appstate still represents an
+   * authenticated Facebook session and refreshes any Set-Cookie values.
+   */
+  logger.debug(
+    'Validating appstate against facebook.com…'
+  );
+
+  const homeRes =
+    await httpClient.get(
+      FB_HOME_URL,
+      {
+        headers: {
+          referer:
+            `${FB_BASE_URL}/`,
+        },
+      }
+    );
+
+  if (
+    homeRes.status !==
+    200
+  ) {
+    throw new Error(
+      `Appstate Facebook session validation failed (HTTP ${homeRes.status})`
+    );
+  }
+
+  const fbCookies =
+    httpClient.getCookies();
+
+  assertFacebookSession(
+    fbCookies
+  );
+
+  /*
+   * Extract Facebook authentication metadata while the authenticated
+   * facebook.com response is still available.
+   */
+  const {
+    dtsg,
+    fbDtsgAg,
+    userID,
+    siteData,
+  } =
+    extractPageTokens(
+      homeRes.data
+    );
+
+  logger.debug(
+    `Facebook session validated for user ${userID}`
+  );
+
+  /*
+   * Second request: Messenger.
+   *
+   * IMPORTANT:
+   * Do this using the SAME HTTP client and cookie jar.
+   * Do not create a new HTTP client here.
+   */
+  await hydrateMessengerCookies(
+    httpClient,
+    logger
+  );
+
+  /*
+   * The MQTT layer must receive the final cookie jar, not the original
+   * appstate and not the pre-Messenger cookie snapshot.
+   */
+  const currentCookies =
+    httpClient.getCookies();
+
+  assertFacebookSession(
+    currentCookies
+  );
+
+  if (
+    countCookies(
+      currentCookies
+    ) === 0
+  ) {
+    throw new Error(
+      'Final authentication cookie jar is empty'
+    );
+  }
+
+  /*
+   * Keep the exact authenticated user ID obtained from Facebook.
+   */
+  const session =
+    createSession({
+      cookies:
+        currentCookies,
+
+      userID,
+
+      clientID:
+        randomString(
+          20
+        ),
+
+      dtsg,
+
+      fbDtsgAg,
+
+      siteData,
+
+      createdAt:
+        Date.now(),
+    });
+
+  logger.info(
+    `Logged in as user ${userID} via appstate`
+  );
+
+  logger.debug(
+    `Final MQTT authentication cookie jar contains ${countCookies(currentCookies)} cookies`
+  );
+
+  return session;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Exports                                                                    */
+/* -------------------------------------------------------------------------- */
+
+module.exports = {
+  loginWithCredentials,
+  loginWithAppState,
+};
