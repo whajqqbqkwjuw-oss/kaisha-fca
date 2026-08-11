@@ -416,29 +416,29 @@ test('buildConnectPacket first byte is 0x10 (CONNECT type)', () => {
   assert.strictEqual(packet[0], 0x10);
 });
 
-test('buildConnectPacket contains protocol name MQIsdp', () => {
+test('buildConnectPacket contains protocol name MQTT (3.1.1)', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
   const pktStr = packet.toString('binary');
-  assert.ok(pktStr.includes('MQIsdp'), 'must contain MQIsdp');
+  assert.ok(pktStr.includes('MQTT'), 'must contain MQTT (3.1.1 protocol name)');
 });
 
-test('buildConnectPacket protocol level byte is 3', () => {
+test('buildConnectPacket protocol level byte is 4 (MQTT 3.1.1)', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
-  // Fixed header (1-2 bytes) + remaining-length + "MQIsdp" length-prefixed (8 bytes) + protocol level
+  // Fixed header (1-2 bytes) + remaining-length + "MQTT" length-prefixed (6 bytes) + protocol level
   const remaining = decodeRemainingLength(packet);
   assert.ok(remaining, 'must decode remaining length');
-  // After fixed header + MQIsdp (2 length + 6 chars = 8 bytes):
-  const protocolLevelOffset = remaining.offset + 8;
-  assert.strictEqual(packet[protocolLevelOffset], 3, 'protocol level must be 3');
+  // After fixed header + "MQTT" (2 length + 4 chars = 6 bytes):
+  const protocolLevelOffset = remaining.offset + 6;
+  assert.strictEqual(packet[protocolLevelOffset], 4, 'protocol level must be 4 (MQTT 3.1.1)');
 });
 
 test('buildConnectPacket connect flags byte is 0x82', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
   const remaining = decodeRemainingLength(packet);
-  const connectFlagsOffset = remaining.offset + 8 + 1; // after protocol name and level
+  const connectFlagsOffset = remaining.offset + 6 + 1; // after "MQTT" (6 bytes) + level (1 byte)
   assert.strictEqual(
     packet[connectFlagsOffset],
     0x82,
@@ -450,7 +450,7 @@ test('buildConnectPacket keepalive is 60 seconds', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
   const remaining = decodeRemainingLength(packet);
-  const keepaliveOffset = remaining.offset + 8 + 1 + 1; // after name, level, flags
+  const keepaliveOffset = remaining.offset + 6 + 1 + 1; // after "MQTT" (6), level (1), flags (1)
   const keepalive = packet.readUInt16BE(keepaliveOffset);
   assert.strictEqual(keepalive, 60, 'keepalive must be 60 seconds');
 });
