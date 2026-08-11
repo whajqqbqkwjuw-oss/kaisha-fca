@@ -324,7 +324,7 @@ function buildConnectPacket(session, mqttSessionID) {
      */
     mqtt_sid:    mqttSessionID,
 
-    aid:         '219994525426954',
+    aid:         219994525426954,   // integer, not string — broker validates JSON type
 
     st:          DEFAULT_TOPICS,
 
