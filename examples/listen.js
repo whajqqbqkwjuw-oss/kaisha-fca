@@ -3,17 +3,24 @@
 /**
  * Example: Listen for Messages
  *
- * Loads an appstate from ./session.json, connects to the Messenger MQTT
- * broker, and prints all incoming messages to the console.  Replies to any
- * message that starts with "!ping" with "Pong!".
+ * Loads an appstate from ./appstate.json (relative to repo root), connects
+ * to the Messenger MQTT broker, and prints all incoming messages clearly:
+ *
+ *   body   : hi
+ *   user   : 61234567890
+ *   thread : 100001234567
+ *
+ * Replies to any message that starts with "!ping" with "Pong!".
  *
  * Usage:
  *   node examples/listen.js
  */
 
-const path   = require('path');
-const fs     = require('fs');
+const path = require('path');
+const fs   = require('fs');
 const http = require('http');
+
+// ── Health server (required for Render) ──────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 
@@ -23,7 +30,6 @@ const healthServer = http.createServer((req, res) => {
     res.end('OK');
     return;
   }
-
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('Kaisha is running');
 });
@@ -31,24 +37,27 @@ const healthServer = http.createServer((req, res) => {
 healthServer.listen(PORT, '0.0.0.0', () => {
   console.log(`Health server listening on port ${PORT}`);
 });
+
+// ── Kaisha ───────────────────────────────────────────────────────────────────
+
 const kaisha = require('../src/index');
 
 async function main() {
   const appstatePath = path.resolve(__dirname, '../appstate.json');
 
-if (!fs.existsSync(appstatePath)) {
-  console.error(`appstate.json not found at ${appstatePath}.`);
-  process.exit(1);
-}
+  if (!fs.existsSync(appstatePath)) {
+    console.error(`appstate.json not found at ${appstatePath}.`);
+    process.exit(1);
+  }
 
-const appstate = JSON.parse(fs.readFileSync(appstatePath, 'utf8'));
+  const appstate = JSON.parse(fs.readFileSync(appstatePath, 'utf8'));
 
-if (!Array.isArray(appstate)) {
-  console.error('Invalid appstate.json format. Expected an array of cookies.');
-  process.exit(1);
-}
+  if (!Array.isArray(appstate)) {
+    console.error('Invalid appstate.json format. Expected an array of cookies.');
+    process.exit(1);
+  }
 
-console.log(`Loaded ${appstate.length} appstate cookies.`);
+  console.log(`Loaded ${appstate.length} appstate cookies.`);
 
   const client = await kaisha.login(
     { type: 'appstate', appstate },
@@ -57,33 +66,59 @@ console.log(`Loaded ${appstate.length} appstate cookies.`);
 
   console.log('Authenticated as user:', client.session.data.userID);
 
+  // ── Events ─────────────────────────────────────────────────────────────────
+
   client.events.on('ready', () => {
     console.log('Kaisha is connected and listening for messages.');
   });
 
+  // ── Incoming message display ────────────────────────────────────────────────
+  //
+  // Each received message is printed in a clear labelled format:
+  //
+  //   ──────────────────────────────────────
+  //   body   : hi
+  //   user   : 61234567890
+  //   thread : 100001234567890
+  //   ──────────────────────────────────────
+  //
   client.events.on('message', async (event) => {
-    console.log(`[Message] ${event.senderID} → Thread ${event.threadID}: ${event.body}`);
+    const divider = '─'.repeat(42);
+    console.log(divider);
+    console.log('body   :', event.body || '(no text content)');
+    console.log('user   :', event.senderID);
+    console.log('thread :', event.threadID);
+    console.log(divider);
 
-    if (event.body.toLowerCase().startsWith('!ping')) {
+    // Auto-reply to !ping
+    if (typeof event.body === 'string' && event.body.toLowerCase().startsWith('!ping')) {
       try {
         await client.api.replyMessage(event.threadID, 'Pong!', event.messageID);
-        console.log('Replied with Pong!');
+        console.log('[replied: Pong!]');
       } catch (err) {
-        console.error('Failed to reply:', err.message);
+        console.error('[reply failed]:', err.message);
       }
     }
   });
 
   client.events.on('message:react', (event) => {
     console.log(
-      `[Reaction] ${event.senderID} reacted ${event.reaction} to message ${event.messageID}`
+      `[Reaction] ${event.senderID} reacted ${event.reaction} ` +
+      `to ${event.messageID}`
     );
   });
 
   client.events.on('message:unsend', (event) => {
     console.log(
-      `[Unsend] ${event.senderID} unsent message ${event.messageID} in thread ${event.threadID}`
+      `[Unsend] ${event.senderID} unsent ${event.messageID} ` +
+      `in thread ${event.threadID}`
     );
+  });
+
+  client.events.on('typing', (event) => {
+    if (event.isTyping) {
+      console.log(`[Typing] ${event.senderID} is typing in thread ${event.threadID}`);
+    }
   });
 
   client.events.on('disconnected', (code) => {
@@ -99,12 +134,15 @@ console.log(`Loaded ${appstate.length} appstate cookies.`);
     process.exit(1);
   });
 
-  // Graceful shutdown
+  // ── Graceful shutdown ───────────────────────────────────────────────────────
+
   process.on('SIGINT', () => {
     console.log('\nShutting down…');
     client.disconnect();
     process.exit(0);
   });
+
+  // ── Connect ─────────────────────────────────────────────────────────────────
 
   await client.listen();
 }
