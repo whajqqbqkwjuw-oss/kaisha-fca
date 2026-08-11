@@ -8,7 +8,7 @@
  * This module builds MQTT packets directly and does not depend on an MQTT
  * client library or any existing Messenger wrapper library.
  *
- * MQTT protocol: 3.1 (MQIsdp / protocol level 3)
+ * MQTT protocol: 3.1.1 (protocol name "MQTT" / protocol level 4)
  * Transport: WebSocket (wss) via the ws package
  * Endpoint: wss://edge-chat.messenger.com/chat
  *
@@ -242,11 +242,11 @@ function decodeCookieValue(value) {
 // ── Packet builders ───────────────────────────────────────────────────────────
 
 /**
- * Builds a complete MQTT 3.1 CONNECT packet.
+ * Builds a complete MQTT 3.1.1 CONNECT packet.
  *
  * The packet structure is:
  *   [Fixed header: type 0x10 + remaining length]
- *   [Protocol name: "MQIsdp" (MQTT 3.1)]
+ *   [Protocol name: "MQTT" / level 4 (MQTT 3.1.1)]
  *   [Protocol level: 3]
  *   [Connect flags: 0x82 = Username + Clean Session]
  *   [Keepalive: 60 s]
@@ -340,15 +340,18 @@ function buildConnectPacket(session, mqttSessionID) {
   });
 
   /*
-   * MQTT 3.1 variable header:
-   *   Protocol name:  "MQIsdp" (6 bytes, length-prefixed = 8 bytes total)
-   *   Protocol level: 3 (1 byte)
+   * MQTT 3.1.1 variable header:
+   *   Protocol name:  "MQTT" (4 bytes, length-prefixed = 6 bytes total) — MQTT 3.1.1
+   *   Protocol level: 4 (1 byte) — MQTT 3.1.1
    *   Connect flags:  0x82 = Username (0x80) + Clean Session (0x02)
    *   Keepalive:      60 s (2 bytes big-endian)
+   *
+   *   NOTE: MQTT 3.1 (MQIsdp / level 3) causes broker to return CONNACK code 21
+   *   which is Messenger's proprietary "wrong protocol version" rejection.
    */
   const variableHeader = Buffer.concat([
-    encodeMqttString('MQIsdp'),
-    Buffer.from([3]),
+    encodeMqttString('MQTT'),
+    Buffer.from([4]),
     Buffer.from([MQTT_CONNECT_FLAGS]),
     Buffer.from([
       (MQTT_KEEPALIVE >> 8) & 0xff,
@@ -357,7 +360,7 @@ function buildConnectPacket(session, mqttSessionID) {
   ]);
 
   /*
-   * MQTT 3.1 CONNECT payload (username flag set, no password flag):
+   * MQTT 3.1.1 CONNECT payload (username flag set, no password flag):
    *   Client Identifier (length-prefixed UTF-8)
    *   Username / auth JSON (length-prefixed UTF-8)
    */
