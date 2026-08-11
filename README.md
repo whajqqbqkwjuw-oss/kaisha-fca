@@ -1,10 +1,10 @@
 # Kaisha
 
-[![Node.js](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen)](https://nodejs.org)
+[![Node.js](https://img.shields.io/badge/node-26.7.0-brightgreen)](https://nodejs.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-1.2.0-orange)](CHANGELOG.md)
 
-**Kaisha** is a production-ready Facebook Messenger library for Node.js 22+.
+**Kaisha** is a production-ready Facebook Messenger library for Node.js 26.7.0.
 
 Built for developers who need a reliable, fully typed, and extensible foundation
 for Messenger bots and automation tools, Kaisha provides real-time event
@@ -51,7 +51,7 @@ and dispatching HTTP requests — all with zero unnecessary dependencies.
 
 ## Requirements
 
-- **Node.js ≥ 22.0.0**
+- **Node.js 26.7.0**
 - npm ≥ 10
 
 ---
