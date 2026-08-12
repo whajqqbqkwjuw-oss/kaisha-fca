@@ -406,26 +406,26 @@ process.stdout.write('\nbuildConnectPacket\n');
 
 test('buildConnectPacket produces a Buffer', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   assert.ok(Buffer.isBuffer(packet), 'must be a Buffer');
 });
 
 test('buildConnectPacket first byte is 0x10 (CONNECT type)', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   assert.strictEqual(packet[0], 0x10);
 });
 
 test('buildConnectPacket contains protocol name MQIsdp (MQTT 3.1)', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   const pktStr = packet.toString('binary');
   assert.ok(pktStr.includes('MQIsdp'), 'must contain MQIsdp (MQTT 3.1 protocol name)');
 });
 
 test('buildConnectPacket protocol level byte is 3 (MQTT 3.1)', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   // Fixed header (1-2 bytes) + remaining-length + "MQIsdp" length-prefixed (8 bytes) + protocol level
   const remaining = decodeRemainingLength(packet);
   assert.ok(remaining, 'must decode remaining length');
@@ -436,7 +436,7 @@ test('buildConnectPacket protocol level byte is 3 (MQTT 3.1)', () => {
 
 test('buildConnectPacket connect flags byte is 0x82', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   const remaining = decodeRemainingLength(packet);
   const connectFlagsOffset = remaining.offset + 8 + 1; // after protocol name and level
   assert.strictEqual(
@@ -448,88 +448,80 @@ test('buildConnectPacket connect flags byte is 0x82', () => {
 
 test('buildConnectPacket keepalive is 60 seconds', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   const remaining = decodeRemainingLength(packet);
   const keepaliveOffset = remaining.offset + 8 + 1 + 1; // after name, level, flags
   const keepalive = packet.readUInt16BE(keepaliveOffset);
   assert.strictEqual(keepalive, 60, 'keepalive must be 60 seconds');
 });
 
-test('buildConnectPacket contains clientID in payload', () => {
+test('buildConnectPacket contains clientGUID in payload', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   assert.ok(
-    packet.toString('utf8').includes('TestClientID12345678'),
-    'must contain clientID'
+    packet.toString('utf8').includes('a1b2c3d4-e5f6-4789-abcd-ef0123456789'),
+    'must contain clientGUID (UUID) in payload'
   );
 });
 
 test('buildConnectPacket contains userID in username JSON', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   assert.ok(
     packet.toString('utf8').includes('100000000000001'),
     'must contain userID'
   );
 });
 
-test('buildConnectPacket URL-decodes xs cookie in username', () => {
-  const session = makeMockSession({
-    cookies: {
-      c_user: '100000000000001',
-      xs:     '2%3AEncodedToken%3A1%3A0%3A%3ADatr',
-    },
-  });
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+test('buildConnectPacket puts sessionNumber in username s field, not xs', () => {
+  const session = makeMockSession();
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   const str = packet.toString('utf8');
-  // The packet must contain the decoded form (colons, not %3A)
-  assert.ok(
-    str.includes('2:EncodedToken:1:0::Datr'),
-    'xs must be URL-decoded in username JSON'
+  const usernameObj = JSON.parse(str.slice(str.indexOf('{'), str.lastIndexOf('}') + 1));
+  assert.strictEqual(
+    usernameObj.s,
+    987654321012345,
+    's field must be the sessionNumber integer, not xs cookie'
   );
-  assert.ok(
-    !str.includes('%3A'),
-    'percent-encoded form must not appear in packet'
-  );
+  assert.strictEqual(usernameObj.mqtt_sid, '', 'mqtt_sid must be empty string');
 });
 
 test('buildConnectPacket throws when userID is missing', () => {
   const session = makeMockSession({ userID: '' });
   session.data.cookies.c_user = '';
   assert.throws(
-    () => buildConnectPacket(session, 'test-session-id-001'),
+    () => buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789'),
     /userID|c_user/
   );
 });
 
-test('buildConnectPacket throws when xs cookie is missing', () => {
+test('buildConnectPacket throws when sessionNumber is missing', () => {
   const session = makeMockSession();
-  session.data.cookies.xs = '';
   assert.throws(
-    () => buildConnectPacket(session, 'test-session-id-001'),
-    /xs/
+    () => buildConnectPacket(session, 0, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789'),
+    /sessionNumber/
   );
 });
 
-test('buildConnectPacket throws when clientID is missing', () => {
-  const session = makeMockSession({ clientID: '' });
+test('buildConnectPacket throws when clientGUID is missing', () => {
+  const session = makeMockSession();
   assert.throws(
-    () => buildConnectPacket(session, 'test-session-id-001'),
-    /clientID/
+    () => buildConnectPacket(session, 987654321012345, ''),
+    /clientGUID/
   );
 });
 
-test('buildConnectPacket throws when mqttSessionID is missing', () => {
+test('buildConnectPacket throws when sessionNumber is zero or missing', () => {
   const session = makeMockSession();
   assert.throws(
-    () => buildConnectPacket(session, ''),
-    /session identifier/
+    () => buildConnectPacket(session, null, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789'),
+    /sessionNumber/
   );
 });
 
 test('buildConnectPacket packet remaining length decodes correctly', () => {
   const session = makeMockSession();
-  const packet = buildConnectPacket(session, 'test-session-id-001');
+  const packet = buildConnectPacket(session, 987654321012345, 'a1b2c3d4-e5f6-4789-abcd-ef0123456789');
   const remaining = decodeRemainingLength(packet);
   assert.ok(remaining, 'remaining length must decode');
   assert.strictEqual(
