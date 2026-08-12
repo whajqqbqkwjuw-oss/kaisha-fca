@@ -416,29 +416,29 @@ test('buildConnectPacket first byte is 0x10 (CONNECT type)', () => {
   assert.strictEqual(packet[0], 0x10);
 });
 
-test('buildConnectPacket contains protocol name MQTT (3.1.1)', () => {
+test('buildConnectPacket contains protocol name MQIsdp', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
   const pktStr = packet.toString('binary');
-  assert.ok(pktStr.includes('MQTT'), 'must contain MQTT (3.1.1 protocol name)');
+  assert.ok(pktStr.includes('MQIsdp'), 'must contain MQIsdp');
 });
 
-test('buildConnectPacket protocol level byte is 4 (MQTT 3.1.1)', () => {
+test('buildConnectPacket protocol level byte is 3', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
-  // Fixed header (1-2 bytes) + remaining-length + "MQTT" length-prefixed (6 bytes) + protocol level
+  // Fixed header (1-2 bytes) + remaining-length + "MQIsdp" length-prefixed (8 bytes) + protocol level
   const remaining = decodeRemainingLength(packet);
   assert.ok(remaining, 'must decode remaining length');
-  // After fixed header + "MQTT" (2 length + 4 chars = 6 bytes):
-  const protocolLevelOffset = remaining.offset + 6;
-  assert.strictEqual(packet[protocolLevelOffset], 4, 'protocol level must be 4 (MQTT 3.1.1)');
+  // After fixed header + MQIsdp (2 length + 6 chars = 8 bytes):
+  const protocolLevelOffset = remaining.offset + 8;
+  assert.strictEqual(packet[protocolLevelOffset], 3, 'protocol level must be 3');
 });
 
 test('buildConnectPacket connect flags byte is 0x82', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
   const remaining = decodeRemainingLength(packet);
-  const connectFlagsOffset = remaining.offset + 6 + 1; // after "MQTT" (6 bytes) + level (1 byte)
+  const connectFlagsOffset = remaining.offset + 8 + 1; // after protocol name and level
   assert.strictEqual(
     packet[connectFlagsOffset],
     0x82,
@@ -450,7 +450,7 @@ test('buildConnectPacket keepalive is 60 seconds', () => {
   const session = makeMockSession();
   const packet = buildConnectPacket(session, 'test-session-id-001');
   const remaining = decodeRemainingLength(packet);
-  const keepaliveOffset = remaining.offset + 6 + 1 + 1; // after "MQTT" (6), level (1), flags (1)
+  const keepaliveOffset = remaining.offset + 8 + 1 + 1; // after name, level, flags
   const keepalive = packet.readUInt16BE(keepaliveOffset);
   assert.strictEqual(keepalive, 60, 'keepalive must be 60 seconds');
 });
@@ -773,10 +773,120 @@ test('createMqttManager isConnected() returns false before connect()', () => {
   const manager = createMqttManager(session, logger);
   assert.strictEqual(manager.isConnected(), false);
 });
+// ─────────────────────────────────────────────────────────────────────────────
+// Root-cause regression tests
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Summary
-// ─────────────────────────────────────────────────────────────────────────────
+process.stdout.write('\nRoot-cause regression: aid type + login flow\n');
+
+test('aid field in CONNECT username JSON is a number (not a string)', () => {
+  const session = makeMockSession();
+  const packet  = buildConnectPacket(session, 'test-session-id-001');
+
+  // Parse the username JSON out of the CONNECT packet
+  const rem = decodeRemainingLength(packet);
+  let off   = rem.offset;
+
+  // Skip variable header: protocol name (2+6), level (1), flags (1), keepalive (2)
+  const protoNameLen = packet.readUInt16BE(off); off += 2 + protoNameLen;
+  off += 1 + 1 + 2;  // level + flags + keepalive
+
+  // Skip client ID
+  const clientIDLen = packet.readUInt16BE(off); off += 2 + clientIDLen;
+
+  // Read username
+  const usernameLen  = packet.readUInt16BE(off); off += 2;
+  const usernameJSON = packet.slice(off, off + usernameLen).toString('utf8');
+  const username     = JSON.parse(usernameJSON);
+
+  assert.strictEqual(
+    typeof username.aid,
+    'number',
+    `aid must be a JSON number — got ${typeof username.aid} ("${username.aid}")`
+  );
+  assert.strictEqual(username.aid, 219994525426954);
+});
+
+test('aid value in CONNECT is 219994525426954 (Messenger app ID)', () => {
+  const session = makeMockSession();
+  const packet  = buildConnectPacket(session, 'test-session-id-002');
+  const rem     = decodeRemainingLength(packet);
+  let off       = rem.offset;
+  const protoNameLen = packet.readUInt16BE(off); off += 2 + protoNameLen;
+  off += 4;
+  const clientIDLen = packet.readUInt16BE(off); off += 2 + clientIDLen;
+  const usernameLen = packet.readUInt16BE(off); off += 2;
+  const username = JSON.parse(packet.slice(off, off + usernameLen).toString('utf8'));
+  assert.ok(username.aid === 219994525426954, 'aid must equal 219994525426954');
+});
+
+test('CONNECT packet mqtt_sid matches the mqttSessionID argument', () => {
+  const session = makeMockSession();
+  const mqttSID = 'test-session-abc-123';
+  const packet  = buildConnectPacket(session, mqttSID);
+  const rem     = decodeRemainingLength(packet);
+  let off       = rem.offset;
+  const protoNameLen = packet.readUInt16BE(off); off += 2 + protoNameLen;
+  off += 4;
+  const clientIDLen = packet.readUInt16BE(off); off += 2 + clientIDLen;
+  const usernameLen = packet.readUInt16BE(off); off += 2;
+  const username = JSON.parse(packet.slice(off, off + usernameLen).toString('utf8'));
+  assert.strictEqual(username.mqtt_sid, mqttSID);
+});
+
+test('login.js exports loginWithAppState and loginWithCredentials', () => {
+  const login = require('../src/login');
+  assert.strictEqual(typeof login.loginWithAppState,   'function');
+  assert.strictEqual(typeof login.loginWithCredentials, 'function');
+});
+
+test('hydrateMessengerCookies is called during loginWithAppState (mock httpClient)', async () => {
+  // We verify the login module calls GET on messenger.com by observing URLs
+  const login = require('../src/login');
+  const urlsRequested = [];
+
+  const mockHttpClient = {
+    setCookies: () => {},
+    getCookies: () => ({
+      c_user: '100000000000001',
+      xs:     '2:Token:1:0::',
+      datr:   'testDatr',
+    }),
+    get: async (url, opts) => {
+      urlsRequested.push(url);
+      if (url.includes('facebook.com')) {
+        return {
+          status: 200,
+          data: '"DTSGInitialData",[],{"token":"testDTSG"} "USER_ID":"100000000000001"',
+        };
+      }
+      if (url.includes('messenger.com')) {
+        return { status: 200, data: '' };
+      }
+      return { status: 200, data: '' };
+    },
+    post: async () => ({ status: 200, data: '' }),
+  };
+
+  const mockLogger = makeMockLogger();
+
+  const fakeAppstate = [
+    { name: 'c_user', value: '100000000000001' },
+    { name: 'xs',     value: '2:Token:1:0::' },
+    { name: 'datr',   value: 'testDatr' },
+  ];
+
+  try {
+    await login.loginWithAppState(fakeAppstate, mockHttpClient, mockLogger);
+  } catch (_) { /* token extraction may fail on simplified HTML — that's ok */ }
+
+  const messengerFetched = urlsRequested.some(u => u.includes('messenger.com'));
+  assert.ok(
+    messengerFetched,
+    `messenger.com was never fetched — MQTT broker would get CONNACK 5.\n` +
+    `URLs requested: ${urlsRequested.join(', ')}`
+  );
+});
 
 process.stdout.write(`\nResults: ${passed} passed, ${failed} failed\n`);
 
