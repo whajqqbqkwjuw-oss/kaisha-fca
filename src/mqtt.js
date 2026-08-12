@@ -8,13 +8,18 @@
  * This module builds MQTT packets directly and does not depend on an MQTT
  * client library or any existing Messenger wrapper library.
  *
- * MQTT protocol: MQIsdp / level 3 (legacy Messenger wire protocol)
+ * MQTT protocol: 3.1 (MQIsdp / protocol level 3)
  * Transport: WebSocket (wss) via the ws package
  * Endpoint: wss://edge-chat.messenger.com/chat
  *
- * Connect flags used: 0x02 (Clean Session only)
- * Messenger's legacy MQTT broker does NOT use the Username flag (0x80).
- * Authentication data is sent inside the username field anyway.
+ * Connect flags used: 0x82
+ *   Bit 7 = Username flag (0x80) — authentication JSON is in the username field
+ *   Bit 1 = Clean Session (0x02)
+ *
+ * Prior bug: the code used 0x42 which set the Password flag (bit 6 = 0x40)
+ * instead of the Username flag (bit 7 = 0x80).  The Messenger broker
+ * authenticates via the username field; sending the credentials as the
+ * password field causes CONNACK returnCode=5 (Not Authorized).
  */
 
 const WebSocket = require('ws');
@@ -36,14 +41,24 @@ const PINGREQ_PACKET_TYPE   = 0xC0;
 /*
  * MQTT connect flags byte.
  *
- * Messenger's legacy MQTT broker expects Clean Session (0x02) but does NOT
- * use the Username flag (0x80) even though the authentication JSON is placed
- * in the username field.  Setting 0x80 causes the broker to reject with
- * CONNACK returnCode 5 (Not Authorized) or 21 (bad protocol).
+ * MQTT 3.1 flags byte layout (MSB → LSB):
+ *   Bit 7: Username flag  = 0x80
+ *   Bit 6: Password flag  = 0x40
+ *   Bit 5: Will Retain    = 0x20
+ *   Bit 4: Will QoS MSB   = 0x10
+ *   Bit 3: Will QoS LSB   = 0x08
+ *   Bit 2: Will flag      = 0x04
+ *   Bit 1: Clean Session  = 0x02
+ *   Bit 0: Reserved       = 0x01 (must be 0)
  *
- * The correct flags value for Messenger MQTT is 0x02.
+ * We use Username (0x80) + Clean Session (0x02) = 0x82.
+ * The authentication JSON is placed in the username field of the payload.
+ * No password field is sent.
+ *
+ * IMPORTANT: 0x42 (former value) sets Password flag (0x40) + Clean Session —
+ * this is wrong and causes the Messenger broker to return CONNACK code 5.
  */
-const MQTT_CONNECT_FLAGS = 0x02;  // Clean Session only
+const MQTT_CONNECT_FLAGS = 0x82;  // Username + Clean Session
 
 const DEFAULT_TOPICS = [
   '/t_ms',
@@ -151,7 +166,7 @@ function decodeRemainingLength(buffer, start = 1) {
 
 /**
  * Generates a unique MQTT session identifier used in both the WebSocket URL
- * `?sid=` parameter and the `s` field of the CONNECT username JSON.
+ * `?sid=` parameter and the `mqtt_sid` field of the CONNECT username JSON.
  *
  * @returns {string}
  */
@@ -200,23 +215,45 @@ function getCookie(session, name) {
   return cookies[name] == null ? '' : String(cookies[name]);
 }
 
+/**
+ * URL-decodes a cookie value when it appears to be URL-encoded.
+ *
+ * Facebook's `xs` session cookie is URL-encoded in HTTP Set-Cookie headers
+ * (e.g. `2%3AToken%3A...`).  The Messenger MQTT broker expects the raw
+ * (decoded) form `2:Token:...` in the CONNECT username JSON.
+ *
+ * If the value does not contain a `%` character decoding is skipped.
+ * If `decodeURIComponent` throws the original value is returned unchanged.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function decodeCookieValue(value) {
+  if (typeof value !== 'string' || !value.includes('%')) {
+    return value;
+  }
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 // ── Packet builders ───────────────────────────────────────────────────────────
 
 /**
- * Builds a complete MQTT CONNECT packet using the legacy Messenger wire format.
+ * Builds a complete MQTT 3.1 CONNECT packet.
  *
  * The packet structure is:
  *   [Fixed header: type 0x10 + remaining length]
- *   [Protocol name: "MQIsdp" / level 3 (not MQTT 3.1.1)]
- *   [Connect flags: 0x02 = Clean Session only]
+ *   [Protocol name: "MQTT" / level 4 (MQTT 3.1.1)]
+ *   [Protocol level: 3]
+ *   [Connect flags: 0x82 = Username + Clean Session]
  *   [Keepalive: 60 s]
- *   [Payload: client ID "mqttwsclient", username JSON]
+ *   [Payload: client ID, username JSON]
  *
- * The username JSON carries all Messenger authentication material:
- *   u = userID
- *   s = session identifier (generated, not the xs cookie)
- *   d = clientID
- *   mqtt_sid = empty string
+ * The username JSON carries all Messenger authentication material.
+ * Authentication data is validated before packet construction.
  *
  * @param {object} session
  * @param {string} mqttSessionID
@@ -230,9 +267,23 @@ function buildConnectPacket(session, mqttSessionID) {
 
   const clientID = getSessionValue(session, 'clientID');
 
+  /*
+   * The xs cookie is the session credential used by Messenger's MQTT broker
+   * for authentication.  It may be URL-encoded in the cookie jar; decode it
+   * to the raw form the broker expects.
+   */
+  const xsRaw = getCookie(session, 'xs');
+  const xs = decodeCookieValue(xsRaw);
+
   if (!userID) {
     throw new Error(
       'Missing userID / c_user cookie — cannot authenticate MQTT session'
+    );
+  }
+
+  if (!xs) {
+    throw new Error(
+      'Missing xs cookie — cannot authenticate MQTT session'
     );
   }
 
@@ -250,51 +301,54 @@ function buildConnectPacket(session, mqttSessionID) {
 
   /*
    * The username JSON is the entire authentication payload for Messenger MQTT.
+   * It must be placed in the MQTT username field (connect flag bit 7 = 0x80).
    *
-   * Fields:
-   *   u: userID (from c_user)
-   *   s: MQTT session identifier (matches the ?sid= in the WebSocket URL)
-   *   d: clientID
-   *   mqtt_sid: empty (legacy Messenger expects this to be empty)
-   *   aid: fixed app ID
-   *   chat_on: true
-   *   fg: false
-   *   ct: 'websocket'
-   *   cp: 3, ecp: 10
-   *   st: [] (topics are subscribed separately, not here)
-   *   pm: []
-   *   dc: ''
-   *   no_auto_fg: true
-   *   gas: null
-   *   pack: []
+   * Authentication material (xs) is intentionally not logged.
    */
   const username = JSON.stringify({
-    u: userID,
-    s: mqttSessionID,
-    chat_on: true,
-    fg: false,
-    d: clientID,
-    ct: 'websocket',
-    aid: '219994525426954',
-    mqtt_sid: '',
-    cp: 3,
-    ecp: 10,
-    st: [],
-    pm: [],
-    dc: '',
-    no_auto_fg: true,
-    gas: null,
-    pack: [],
+    u:           userID,
+    s:           xs,
+
+    cp:          3,
+    ecp:         10,
+
+    chat_on:     true,
+    fg:          false,
+
+    d:           clientID,
+    ct:          'websocket',
+
+    /*
+     * The MQTT session identifier must match the ?sid= query parameter in the
+     * WebSocket URL.  Both are set to the same value generated in connect().
+     */
+    mqtt_sid:    mqttSessionID,
+
+    aid:         '219994525426954',  // string — broker expects JSON string, not number
+
+    st:          DEFAULT_TOPICS,
+
+    pm:          [],
+
+    dc:          '',
+    no_auto_fg:  true,
+
+    gas:         null,
+    pack:        [],
+
+    locale:      'en_US',
   });
 
   /*
-   * Legacy Messenger MQTT wire protocol:
+   * MQTT 3.1 variable header:
+   *   Protocol name:  "MQIsdp" (6 bytes, length-prefixed = 8 bytes total) — MQTT 3.1
+   *   Protocol level: 3 (1 byte) — MQTT 3.1
+   *   Connect flags:  0x82 = Username (0x80) + Clean Session (0x02)
+   *   Keepalive:      60 s (2 bytes big-endian)
    *
-   * Protocol name: MQIsdp  (NOT "MQTT")
-   * Protocol level: 3       (NOT 4)
-   *
-   * Using "MQTT" / level 4 causes the broker to return CONNACK code 21
-   * (protocol version not supported).
+   *   NOTE: MQTT 3.1.1 ("MQTT"/level 4) causes the broker to close the WebSocket
+   *   immediately with code=1000 reason="Bye" (no CONNACK at all).
+   *   The Messenger broker requires MQTT 3.1 (MQIsdp/level 3).
    */
   const variableHeader = Buffer.concat([
     encodeMqttString('MQIsdp'),
@@ -307,20 +361,16 @@ function buildConnectPacket(session, mqttSessionID) {
   ]);
 
   /*
-   * CONNECT payload:
-   *
-   * Client identifier: "mqttwsclient" (fixed, Messenger expects this exact string)
-   * Username: JSON authentication object
+   * MQTT 3.1 CONNECT payload (username flag set, no password flag):
+   *   Client Identifier (length-prefixed UTF-8)
+   *   Username / auth JSON (length-prefixed UTF-8)
    */
   const payload = Buffer.concat([
-    encodeMqttString('mqttwsclient'),
+    encodeMqttString(clientID),
     encodeMqttString(username),
   ]);
 
-  const body = Buffer.concat([
-    variableHeader,
-    payload,
-  ]);
+  const body = Buffer.concat([variableHeader, payload]);
 
   return Buffer.concat([
     Buffer.from([CONNECT_PACKET_TYPE]),
@@ -472,6 +522,7 @@ function createMqttManager(
 
   let reconnectAttempts = 0;
   let intentionallyClosed = false;
+  let authFailure         = false;  // set on CONNACK returnCode 1-5; suppresses reconnect
   let sessionReady        = false;
 
   let packetIDCounter = 1;
@@ -586,9 +637,8 @@ function createMqttManager(
    * Handles a received CONNACK packet.
    *
    * ReturnCode 0: session established — start keepalive, subscribe, fire callback.
-   * ReturnCode 1-5: authentication or protocol rejection — log error, fire
-   *   error callback, close socket.  Reconnection is handled in the close handler
-   *   (unless intentionally closed).
+   * ReturnCode 1-5: authentication or protocol rejection — mark authFailure,
+   *   fire error callback, close socket.  Does NOT initiate reconnect.
    *
    * @param {Buffer} buffer
    */
@@ -607,7 +657,13 @@ function createMqttManager(
     clearConnectTimeout();
 
     if (result.returnCode !== 0) {
+      /*
+       * Codes 1-5 are broker-level rejections (protocol, identifier, auth).
+       * None of them will be resolved by reconnecting with the same credentials.
+       * Mark authFailure so the close handler suppresses reconnect.
+       */
       sessionReady = false;
+      authFailure  = true;
 
       const descriptions = {
         1: 'Unacceptable protocol version',
@@ -632,8 +688,8 @@ function createMqttManager(
       }
 
       /*
-       * Close the WebSocket.  The close handler will attempt to reconnect
-       * unless intentionallyClosed is set.
+       * Close the WebSocket cleanly.  The close handler will see authFailure=true
+       * and will not attempt to reconnect.
        */
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
@@ -651,6 +707,7 @@ function createMqttManager(
 
     sessionReady      = true;
     reconnectAttempts = 0;
+    authFailure       = false;
 
     logger.info('MQTT session established successfully');
 
@@ -833,10 +890,6 @@ function createMqttManager(
    * Cookies are serialised from the session and sent as the Cookie header.
    * The WebSocket origin and referer headers are set to messenger.com.
    *
-   * The URL contains only the `?sid=` parameter.  The `&cid=` is NOT included
-   * because the legacy Messenger MQTT broker expects the clientID only inside
-   * the CONNECT payload (username JSON) and not in the query string.
-   *
    * @param {string} mqttSessionID
    * @returns {WebSocket}
    */
@@ -862,21 +915,21 @@ function createMqttManager(
     }
 
     /*
-     * The MQTT session identifier is used both in the URL and in the CONNECT
-     * payload (s field).  The clientID is NOT passed as a URL parameter.
+     * Both sid and cid query parameters must match the values used in the
+     * MQTT CONNECT packet username JSON (mqtt_sid and d fields respectively).
      */
     const mqttUrl =
-      `${MQTT_HOST}?sid=${encodeURIComponent(mqttSessionID)}`;
+      `${MQTT_HOST}?sid=${encodeURIComponent(mqttSessionID)}` +
+      `&cid=${encodeURIComponent(clientID)}`;
 
     logger.info('Connecting to Messenger MQTT broker…');
-    logger.debug(`MQTT endpoint: ${MQTT_HOST}?sid=...`);
+    logger.debug(`MQTT endpoint: ${MQTT_HOST}?sid=...&cid=...`);
 
     const socket = new WebSocket(mqttUrl, {
       headers: {
         Cookie:          cookieString,
         Origin:          'https://www.messenger.com',
         Referer:         'https://www.messenger.com/',
-        Host:            new URL(mqttUrl).hostname,
         Pragma:          'no-cache',
         'Cache-Control': 'no-cache',
         'User-Agent':
@@ -909,6 +962,7 @@ function createMqttManager(
     onErrorCallback      = onError;
 
     intentionallyClosed = false;
+    authFailure         = false;
 
     clearConnectTimeout();
     stopPing();
@@ -917,7 +971,7 @@ function createMqttManager(
 
     /*
      * One MQTT session identifier per connection attempt.
-     * Used in the WebSocket URL ?sid= and in the CONNECT username s field.
+     * Used in the WebSocket URL ?sid= and in the CONNECT username mqtt_sid.
      */
     const mqttSessionID = createSessionIdentifier();
 
@@ -1025,17 +1079,25 @@ function createMqttManager(
       }
 
       /*
-       * Suppress reconnect if:
-       *   intentionallyClosed — caller called disconnect()
-       *   maxReconnectAttempts exhausted — give up and report error
+       * Suppress reconnect in three cases:
        *
-       * Unlike previous versions, this implementation does NOT use authFailure
-       * to suppress reconnect.  All non-intentional closes trigger a reconnect
-       * attempt, even on CONNACK errors (1-5).  This matches the behaviour of
-       * Messenger clients and allows the connection to recover if the broker's
-       * rejection was transient (e.g., temporary session state).
+       *   intentionallyClosed — caller called disconnect()
+       *   authFailure         — broker rejected CONNECT with code 1-5;
+       *                          reconnecting with the same credentials is useless
+       *   maxReconnectAttempts exhausted — give up and report error
        */
       if (intentionallyClosed) {
+        return;
+      }
+
+      if (authFailure) {
+        /*
+         * onError was already fired in handleConnack for auth failures;
+         * do not fire it again here.
+         */
+        logger.error(
+          'MQTT authentication rejected by broker — not reconnecting'
+        );
         return;
       }
 
@@ -1065,7 +1127,7 @@ function createMqttManager(
 
       await sleep(delay);
 
-      if (intentionallyClosed) return;
+      if (intentionallyClosed || authFailure) return;
 
       connect(onConnectCallback, onDisconnectCallback, onErrorCallback);
     });
@@ -1095,6 +1157,7 @@ function createMqttManager(
   function disconnect() {
     intentionallyClosed = true;
     sessionReady        = false;
+    authFailure         = false;
 
     clearConnectTimeout();
     stopPing();
@@ -1152,5 +1215,6 @@ module.exports = {
   _buildSubscribePacket:  buildSubscribePacket,
   _buildPingPacket:       buildPingPacket,
   _parseConnack:          parseConnack,
+  _decodeCookieValue:     decodeCookieValue,
   _MQTT_CONNECT_FLAGS:    MQTT_CONNECT_FLAGS,
 };
