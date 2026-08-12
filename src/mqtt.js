@@ -25,7 +25,7 @@
 const WebSocket = require('ws');
 const { sleep, randomInt } = require('./utils');
 
-const MQTT_HOST = 'wss://edge-chat.messenger.com/chat';
+const MQTT_HOST = 'wss://edge-chat.facebook.com/chat';
 
 const MQTT_KEEPALIVE         = 60;
 const MQTT_CONNECT_TIMEOUT   = 20_000;
@@ -61,6 +61,7 @@ const PINGREQ_PACKET_TYPE   = 0xC0;
 const MQTT_CONNECT_FLAGS = 0x82;  // Username + Clean Session
 
 const DEFAULT_TOPICS = [
+  '/legacy_web',
   '/t_ms',
   '/thread_typing',
   '/orca_typing_notifications',
@@ -69,10 +70,15 @@ const DEFAULT_TOPICS = [
   '/mercury',
   '/messaging_events',
   '/webrtc',
+  '/rtc_multi',
+  '/onevc',
   '/br_sr',
   '/sr_res',
   '/pp',
   '/webrtc_response',
+  '/notify_disconnect',
+  '/orca_message_notifications',
+  '/ls_resp',
 ];
 
 // ── MQTT encoding helpers ─────────────────────────────────────────────────────
@@ -165,15 +171,31 @@ function decodeRemainingLength(buffer, start = 1) {
 // ── Session identifier ────────────────────────────────────────────────────────
 
 /**
- * Generates a unique MQTT session identifier used in both the WebSocket URL
- * `?sid=` parameter and the `mqtt_sid` field of the CONNECT username JSON.
+ * Generates a UUID v4 string used as the MQTT client identifier (d / cid).
+ * Matches the format produced by ST-FCA's getGUID().
  *
- * @returns {string}
+ * @returns {string}  e.g. "550e8400-e29b-41d4-a716-446655440000"
  */
-function createSessionIdentifier() {
-  const timestamp = Date.now().toString(36);
-  const random = Math.random().toString(36).slice(2, 14);
-  return `${timestamp}-${random}`;
+function generateGUID() {
+  var sectionLength = Date.now();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+    var r = Math.floor((sectionLength + Math.random() * 16) % 16);
+    sectionLength = Math.floor(sectionLength / 16);
+    var v = c === 'x' ? r : (r & 7) | 8;
+    return v.toString(16);
+  });
+}
+
+/**
+ * Generates a random MQTT session number used as the `s` field in the CONNECT
+ * username JSON and as the `?sid=` URL parameter.
+ *
+ * ST-FCA uses: Math.floor(Math.random() * 9007199254740991) + 1
+ *
+ * @returns {number}
+ */
+function generateSessionNumber() {
+  return Math.floor(Math.random() * 9007199254740991) + 1;
 }
 
 // ── Session value helpers ─────────────────────────────────────────────────────
@@ -256,24 +278,15 @@ function decodeCookieValue(value) {
  * Authentication data is validated before packet construction.
  *
  * @param {object} session
- * @param {string} mqttSessionID
+ * @param {number} sessionNumber  - Random large integer for `s` field and ?sid= URL param.
+ * @param {string} clientGUID     - UUID string for `d` field and ?cid= URL param.
  * @returns {Buffer}
  * @throws {Error} when required authentication material is missing.
  */
-function buildConnectPacket(session, mqttSessionID) {
+function buildConnectPacket(session, sessionNumber, clientGUID) {
   const userID =
     getSessionValue(session, 'userID') ||
     getCookie(session, 'c_user');
-
-  const clientID = getSessionValue(session, 'clientID');
-
-  /*
-   * The xs cookie is the session credential used by Messenger's MQTT broker
-   * for authentication.  It may be URL-encoded in the cookie jar; decode it
-   * to the raw form the broker expects.
-   */
-  const xsRaw = getCookie(session, 'xs');
-  const xs = decodeCookieValue(xsRaw);
 
   if (!userID) {
     throw new Error(
@@ -281,62 +294,60 @@ function buildConnectPacket(session, mqttSessionID) {
     );
   }
 
-  if (!xs) {
+  if (!sessionNumber) {
     throw new Error(
-      'Missing xs cookie — cannot authenticate MQTT session'
+      'Missing sessionNumber — cannot construct MQTT CONNECT packet'
     );
   }
 
-  if (!clientID) {
+  if (!clientGUID) {
     throw new Error(
-      'Missing clientID — cannot construct MQTT CONNECT packet'
-    );
-  }
-
-  if (!mqttSessionID) {
-    throw new Error(
-      'Missing MQTT session identifier — cannot construct MQTT CONNECT packet'
+      'Missing clientGUID — cannot construct MQTT CONNECT packet'
     );
   }
 
   /*
-   * The username JSON is the entire authentication payload for Messenger MQTT.
-   * It must be placed in the MQTT username field (connect flag bit 7 = 0x80).
+   * Username JSON — verified field-by-field against working ST-FCA.
    *
-   * Authentication material (xs) is intentionally not logged.
+   * ROOT CAUSE FIX:
+   *   `s` must be a random large integer (MQTT session number).
+   *   Using the xs cookie in `s` caused CONNACK 5 and CONNACK 21 errors.
+   *
+   *   `mqtt_sid` must be empty string (ST-FCA confirmed).
+   *   `aids`, `p`, `php_override` are required by the current broker.
    */
   const username = JSON.stringify({
-    u:           userID,
-    s:           xs,
+    u:             userID,
+    s:             sessionNumber,    // random large int — NOT xs cookie
 
-    cp:          3,
-    ecp:         10,
+    cp:            3,
+    ecp:           10,
 
-    chat_on:     true,
-    fg:          false,
+    chat_on:       true,
+    fg:            false,
 
-    d:           clientID,
-    ct:          'websocket',
+    d:             clientGUID,       // UUID matching ?cid= URL param
+    ct:            'websocket',
 
-    /*
-     * The MQTT session identifier must match the ?sid= query parameter in the
-     * WebSocket URL.  Both are set to the same value generated in connect().
-     */
-    mqtt_sid:    mqttSessionID,
+    mqtt_sid:      '',               // empty string — ST-FCA confirmed
 
-    aid:         '219994525426954',  // string — broker expects JSON string, not number
+    aid:           '219994525426954', // string — broker rejects integer form
+    aids:          null,
 
-    st:          DEFAULT_TOPICS,
+    st:            DEFAULT_TOPICS,
 
-    pm:          [],
+    pm:            [],
 
-    dc:          '',
-    no_auto_fg:  true,
+    dc:            '',
+    no_auto_fg:    true,
 
-    gas:         null,
-    pack:        [],
+    gas:           null,
+    pack:          [],
 
-    locale:      'en_US',
+    p:             null,
+    php_override:  '',
+
+    locale:        'en_US',
   });
 
   /*
@@ -366,7 +377,7 @@ function buildConnectPacket(session, mqttSessionID) {
    *   Username / auth JSON (length-prefixed UTF-8)
    */
   const payload = Buffer.concat([
-    encodeMqttString(clientID),
+    encodeMqttString(clientGUID),
     encodeMqttString(username),
   ]);
 
@@ -890,10 +901,11 @@ function createMqttManager(
    * Cookies are serialised from the session and sent as the Cookie header.
    * The WebSocket origin and referer headers are set to messenger.com.
    *
-   * @param {string} mqttSessionID
+   * @param {number} sessionNumber - Random large integer for ?sid= and username `s`.
+   * @param {string} clientGUID   - UUID for ?cid= and username `d`.
    * @returns {WebSocket}
    */
-  function createWebSocket(mqttSessionID) {
+  function createWebSocket(sessionNumber, clientGUID) {
     const cookies =
       session &&
       session.data &&
@@ -906,36 +918,33 @@ function createMqttManager(
       .map(([key, value]) => `${key}=${String(value)}`)
       .join('; ');
 
-    const clientID = getSessionValue(session, 'clientID');
-
-    if (!clientID) {
-      throw new Error(
-        'Cannot create MQTT WebSocket without session clientID'
-      );
-    }
-
     /*
-     * Both sid and cid query parameters must match the values used in the
-     * MQTT CONNECT packet username JSON (mqtt_sid and d fields respectively).
+     * sid = random session number (matches `s` in username JSON)
+     * cid = UUID (matches `d` in username JSON)
      */
     const mqttUrl =
-      `${MQTT_HOST}?sid=${encodeURIComponent(mqttSessionID)}` +
-      `&cid=${encodeURIComponent(clientID)}`;
+      `${MQTT_HOST}?region=pnb&sid=${sessionNumber}&cid=${encodeURIComponent(clientGUID)}`;
 
-    logger.info('Connecting to Messenger MQTT broker…');
-    logger.debug(`MQTT endpoint: ${MQTT_HOST}?sid=...&cid=...`);
+    logger.info('Connecting to Facebook MQTT broker…');
+    logger.debug(`MQTT endpoint: ${MQTT_HOST}?region=pnb&sid=...&cid=...`);
 
     const socket = new WebSocket(mqttUrl, {
       headers: {
-        Cookie:          cookieString,
-        Origin:          'https://www.messenger.com',
-        Referer:         'https://www.messenger.com/',
-        Pragma:          'no-cache',
-        'Cache-Control': 'no-cache',
+        Cookie:                       cookieString,
+        Origin:                       'https://www.facebook.com',
+        Referer:                      'https://www.facebook.com/',
+        Host:                         'edge-chat.facebook.com',
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
           'Chrome/138.0.0.0 Safari/537.36',
+        'Accept-Language':            'en-US,en;q=0.9',
+        'Accept-Encoding':            'gzip, deflate, br',
+        'Cache-Control':              'no-cache',
+        Pragma:                       'no-cache',
+        Connection:                   'Upgrade',
+        Upgrade:                      'websocket',
+        'Sec-WebSocket-Version':      '13',
       },
       handshakeTimeout:    30_000,
       perMessageDeflate:   false,
@@ -970,15 +979,22 @@ function createMqttManager(
     receiveBuffer = Buffer.alloc(0);
 
     /*
-     * One MQTT session identifier per connection attempt.
-     * Used in the WebSocket URL ?sid= and in the CONNECT username mqtt_sid.
+     * Generate fresh session identifiers for each connection attempt.
+     *
+     * sessionNumber: random large integer → used as ?sid= URL param AND
+     *                the `s` field in the CONNECT username JSON.
+     * clientGUID:    UUID format → used as ?cid= URL param AND
+     *                the `d` field in the CONNECT username JSON.
+     *
+     * Verified against ST-FCA (working implementation).
      */
-    const mqttSessionID = createSessionIdentifier();
+    const sessionNumber = generateSessionNumber();
+    const clientGUID    = generateGUID();
 
     let socket;
 
     try {
-      socket = createWebSocket(mqttSessionID);
+      socket = createWebSocket(sessionNumber, clientGUID);
     } catch (err) {
       logger.error('Failed to create MQTT WebSocket:', err);
       if (onErrorCallback) onErrorCallback(err);
@@ -998,7 +1014,7 @@ function createMqttManager(
       let packet;
 
       try {
-        packet = buildConnectPacket(session, mqttSessionID);
+        packet = buildConnectPacket(session, sessionNumber, clientGUID);
       } catch (err) {
         logger.error('Failed to create MQTT CONNECT:', err);
         if (onErrorCallback) onErrorCallback(err);
