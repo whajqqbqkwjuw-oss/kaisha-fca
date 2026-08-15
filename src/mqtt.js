@@ -193,6 +193,14 @@ function generateSessionNumber() {
   return Math.floor(Math.random() * 9007199254740991) + 1;
 }
 
+/** Generates a fallback persistent-style Messenger client ID. */
+function generateClientID() {
+  const alphabet = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let out = '';
+  for (let i = 0; i < 20; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return out;
+}
+
 // ── Session value helpers ─────────────────────────────────────────────────────
 
 /**
@@ -298,6 +306,7 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
     d: clientGUID,
     ct: 'websocket',
     aid: '219994525426954',
+    aids: null,
     mqtt_sid: '',
     cp: 3,
     ecp: 10,
@@ -307,6 +316,8 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
     no_auto_fg: true,
     gas: null,
     pack: [],
+    p: null,
+    php_override: '',
     a:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
       'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -917,7 +928,7 @@ function createMqttManager(
    * The WebSocket origin and referer headers are set to messenger.com.
    *
    * @param {number} sessionNumber - Random large integer for ?sid= and username `s`.
-   * @param {string} clientGUID   - UUID for ?cid= and username `d`.
+   * @param {string} clientGUID   - Persistent Messenger client ID for ?cid= and username `d`.
    * @returns {WebSocket}
    */
   function createWebSocket(sessionNumber, clientGUID) {
@@ -953,6 +964,7 @@ function createMqttManager(
       }
     });
 
+    logger.debug(`Messenger MQTT client ID: ${clientGUID}`);
     logger.debug(`Attempting WebSocket connection to ${mqttUrl}`);
 
     const socket = new WebSocket(mqttUrl, {
@@ -1015,7 +1027,13 @@ function createMqttManager(
      * Uses a fresh session identifier for each connection attempt.
      */
     const sessionNumber = generateSessionNumber();
-    const clientGUID    = generateGUID();
+    // Messenger uses the persistent client ID established during login for both
+    // the `d` username field and the `cid` query parameter. A fresh UUID here
+    // causes the broker to reject an otherwise valid CONNECT.
+    const clientGUID =
+      (session && session.data && session.data.clientID)
+        ? String(session.data.clientID)
+        : generateClientID();
 
     let socket;
 
