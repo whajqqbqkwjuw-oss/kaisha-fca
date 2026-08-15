@@ -27,9 +27,9 @@ const crypto = require('crypto');
 const dns = require('dns');
 const { sleep, randomInt } = require('./utils');
 
-const MQTT_HOST = 'wss://edge-chat.facebook.com/chat';
+const MQTT_HOST = 'wss://edge-chat.messenger.com/chat';
 
-const MQTT_KEEPALIVE         = 60;
+const MQTT_KEEPALIVE         = 10;
 const MQTT_CONNECT_TIMEOUT   = 20_000;
 const MQTT_CLOSE_CODE_NORMAL = 1000;  // Normal closure
 
@@ -55,10 +55,9 @@ const PINGREQ_PACKET_TYPE   = 0xC0;
  *
  * We use Username (0x80) + Clean Session (0x02) = 0x82.
  * The authentication JSON is placed in the username field of the payload.
- * No password field is sent.
+ * No MQTT password field is sent.
  *
- * IMPORTANT: 0x42 (former value) sets Password flag (0x40) + Clean Session —
- * this is wrong and causes the Messenger broker to return CONNACK code 5.
+ * Password is not used by this transport.
  */
 const MQTT_CONNECT_FLAGS = 0x82;  // Username + Clean Session
 
@@ -186,7 +185,7 @@ function generateGUID() {
  * Generates a random MQTT session number used as the `s` field in the CONNECT
  * username JSON and as the `?sid=` URL parameter.
  *
- * ST-FCA uses: Math.floor(Math.random() * 9007199254740991) + 1
+ * The session uses: Math.floor(Math.random() * 9007199254740991) + 1
  *
  * @returns {number}
  */
@@ -279,47 +278,32 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
   }
 
   /*
-   * Username JSON — verified field-by-field against working ST-FCA.
+   * Messenger session username JSON.
    *
-   * ROOT CAUSE FIX:
+   * Authentication/session construction:
    *   `s` must be a random large integer (MQTT session number).
    *   Using the xs cookie in `s` caused CONNACK 5 and CONNACK 21 errors.
    *
-   *   `mqtt_sid` must be empty string (ST-FCA confirmed).
+   *   `mqtt_sid` must be empty string (current Messenger-compatible session format).
    *   `aids`, `p`, `php_override` are required by the current broker.
    */
   const username = JSON.stringify({
-    u:             userID,
-    s:             sessionNumber,
-
-    cp:            3,
-    ecp:           10,
-
-    chat_on:       true,
-    fg:            false,
-
-    d:             clientGUID,
-    ct:            'websocket',
-
-    mqtt_sid:      sessionNumber,
-
-    aid:           '219994525426954',
-    aids:          [],
-
-    st:            DEFAULT_TOPICS,   // Topics are subscribed separately after CONNACK
-
-    pm:            [],
-
-    dc:            '',
-    no_auto_fg:    true,
-    gas:           null,
-    pack:          [],
-
-    p:             null,
-    php_override:  '',
-
-    locale:        'en_US',
-
+    u:         userID,
+    s:         sessionNumber,
+    chat_on:   true,
+    fg:        false,
+    d:         clientGUID,
+    ct:        'websocket',
+    aid:       '219994525426954',
+    mqtt_sid:  '',
+    cp:        3,
+    ecp:       10,
+    st:        [],
+    pm:        [],
+    dc:        '',
+    no_auto_fg: true,
+    gas:       null,
+    pack:      [],
     a:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
       'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -355,7 +339,6 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
   const payload = Buffer.concat([
     encodeMqttString('mqttwsclient'),
     encodeMqttString(username),
-    encodeMqttString(''),
   ]);
 
   const body = Buffer.concat([variableHeader, payload]);
@@ -953,7 +936,7 @@ function createMqttManager(
     const mqttUrl =
       `${MQTT_HOST}?region=pnb&sid=${sessionNumber}&cid=${encodeURIComponent(clientGUID)}`;
 
-    logger.info('Connecting to Facebook MQTT broker…');
+    logger.info('Connecting to Messenger MQTT broker…');
     logger.debug(`MQTT endpoint: ${MQTT_HOST}?region=pnb&sid=...&cid=...`);
 
     // Diagnostic: DNS lookup before WebSocket creation
@@ -971,8 +954,9 @@ function createMqttManager(
     const socket = new WebSocket(mqttUrl, {
       headers: {
         Cookie:          cookieString,
-        Origin:          'https://www.facebook.com',
-        Referer:         'https://www.facebook.com/',
+        Origin:          'https://www.messenger.com',
+        Referer:         'https://www.messenger.com/',
+        Host:            new URL(mqttUrl).hostname,
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -1022,7 +1006,7 @@ function createMqttManager(
      * clientGUID:    UUID format → used as ?cid= URL param AND
      *                the `d` field in the CONNECT username JSON.
      *
-     * Verified against ST-FCA (working implementation).
+     * Uses a fresh session identifier for each connection attempt.
      */
     const sessionNumber = generateSessionNumber();
     const clientGUID    = generateGUID();
