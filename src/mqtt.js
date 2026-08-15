@@ -10,7 +10,7 @@
  *
  * MQTT protocol: 3.1 (MQIsdp / protocol level 3)
  * Transport: WebSocket (wss) via the ws package
- * Endpoint: wss://edge-chat.messenger.com/chat
+ * Endpoint: wss://edge-chat.facebook.com/chat
  *
  * Connect flags used: 0x82
  *   Bit 7 = Username flag (0x80) — authentication JSON is in the username field
@@ -23,13 +23,15 @@
  */
 
 const WebSocket = require('ws');
+const crypto = require('crypto');
+const dns = require('dns');
 const { sleep, randomInt } = require('./utils');
 
 const MQTT_HOST = 'wss://edge-chat.facebook.com/chat';
 
 const MQTT_KEEPALIVE         = 60;
 const MQTT_CONNECT_TIMEOUT   = 20_000;
-const MQTT_HANDSHAKE_CLOSE_CODE = 1002;
+const MQTT_CLOSE_CODE_NORMAL = 1000;  // Normal closure
 
 /*
  * MQTT packet type constants (first nibble of first byte).
@@ -171,19 +173,13 @@ function decodeRemainingLength(buffer, start = 1) {
 // ── Session identifier ────────────────────────────────────────────────────────
 
 /**
- * Generates a UUID v4 string used as the MQTT client identifier (d / cid).
- * Matches the format produced by ST-FCA's getGUID().
+ * Generates a UUID v4 string using Node.js native crypto.
+ * Used as the MQTT client identifier (d / cid).
  *
  * @returns {string}  e.g. "550e8400-e29b-41d4-a716-446655440000"
  */
 function generateGUID() {
-  var sectionLength = Date.now();
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-    var r = Math.floor((sectionLength + Math.random() * 16) % 16);
-    sectionLength = Math.floor(sectionLength / 16);
-    var v = c === 'x' ? r : (r & 7) | 8;
-    return v.toString(16);
-  });
+  return crypto.randomUUID();
 }
 
 /**
@@ -237,30 +233,6 @@ function getCookie(session, name) {
   return cookies[name] == null ? '' : String(cookies[name]);
 }
 
-/**
- * URL-decodes a cookie value when it appears to be URL-encoded.
- *
- * Facebook's `xs` session cookie is URL-encoded in HTTP Set-Cookie headers
- * (e.g. `2%3AToken%3A...`).  The Messenger MQTT broker expects the raw
- * (decoded) form `2:Token:...` in the CONNECT username JSON.
- *
- * If the value does not contain a `%` character decoding is skipped.
- * If `decodeURIComponent` throws the original value is returned unchanged.
- *
- * @param {string} value
- * @returns {string}
- */
-function decodeCookieValue(value) {
-  if (typeof value !== 'string' || !value.includes('%')) {
-    return value;
-  }
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
 // ── Packet builders ───────────────────────────────────────────────────────────
 
 /**
@@ -268,11 +240,11 @@ function decodeCookieValue(value) {
  *
  * The packet structure is:
  *   [Fixed header: type 0x10 + remaining length]
- *   [Protocol name: "MQTT" / level 4 (MQTT 3.1.1)]
- *   [Protocol level: 3]
+ *   [Protocol name: "MQIsdp" / level 3 (MQTT 3.1)]
  *   [Connect flags: 0x82 = Username + Clean Session]
  *   [Keepalive: 60 s]
- *   [Payload: client ID, username JSON]
+ *   [Client ID: "mqttwsclient" (fixed)]
+ *   [Username: JSON authentication object]
  *
  * The username JSON carries all Messenger authentication material.
  * Authentication data is validated before packet construction.
@@ -317,41 +289,42 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
    *   `aids`, `p`, `php_override` are required by the current broker.
    */
   const username = JSON.stringify({
-  u:             userID,
-  s:             sessionNumber,
-  cp:            3,
-  ecp:           10,
+    u:             userID,
+    s:             sessionNumber,
 
-  chat_on:       true,
-  fg:            false,
+    cp:            3,
+    ecp:           10,
 
-  d:             clientGUID,
-  ct:            'websocket',
+    chat_on:       true,
+    fg:            false,
 
-  mqtt_sid:      '',
+    d:             clientGUID,
+    ct:            'websocket',
 
-  aid:           '219994525426954',
-  aids:          null,
+    mqtt_sid:      '',
 
-  st:             DEFAULT_TOPICS,
+    aid:           '219994525426954',
+    aids:          null,
 
-  pm:             [],
+    st:            [],   // Topics are subscribed separately after CONNACK
 
-  dc:             '',
-  no_auto_fg:    true,
-  gas:            null,
-  pack:           [],
+    pm:            [],
 
-  p:             null,
-  php_override:  '',
+    dc:            '',
+    no_auto_fg:    true,
+    gas:           null,
+    pack:          [],
 
-  locale:        'en_US',
+    p:             null,
+    php_override:  '',
 
-  a:
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
-    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-    'Chrome/138.0.0.0 Safari/537.36',
-});
+    locale:        'en_US',
+
+    a:
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+      'Chrome/138.0.0.0 Safari/537.36',
+  });
 
   /*
    * MQTT 3.1 variable header:
@@ -376,11 +349,11 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
 
   /*
    * MQTT 3.1 CONNECT payload (username flag set, no password flag):
-   *   Client Identifier (length-prefixed UTF-8)
-   *   Username / auth JSON (length-prefixed UTF-8)
+   *   Client Identifier: "mqttwsclient" (fixed, Messenger expects this exact string)
+   *   Username / auth JSON
    */
   const payload = Buffer.concat([
-    encodeMqttString(clientGUID),
+    encodeMqttString('mqttwsclient'),
     encodeMqttString(username),
   ]);
 
@@ -536,7 +509,7 @@ function createMqttManager(
 
   let reconnectAttempts = 0;
   let intentionallyClosed = false;
-  let authFailure         = false;  // set on CONNACK returnCode 1-5; suppresses reconnect
+  let authFailure         = false;  // set on definite auth/protocol rejections (returnCode 1,2,4,5)
   let sessionReady        = false;
 
   let packetIDCounter = 1;
@@ -627,6 +600,26 @@ function createMqttManager(
 
   // ── Subscribe ───────────────────────────────────────────────────────────────
 
+  /**
+   * Returns the next MQTT packet ID, wrapping from 65535 to 1 (never 0).
+   *
+   * MQTT packet identifiers are 16-bit unsigned integers.  The value 0 is
+   * reserved and must not be used for SUBSCRIBE, PUBLISH, or UNSUBSCRIBE.
+   *
+   * @returns {number}
+   */
+  function nextPacketID() {
+    const id = packetIDCounter;
+
+    packetIDCounter++;
+
+    if (packetIDCounter > 0xffff) {
+      packetIDCounter = 1;
+    }
+
+    return id;
+  }
+
   function subscribeToTopics() {
     if (!ws || ws.readyState !== WebSocket.OPEN || !sessionReady) {
       logger.warn('Cannot subscribe: MQTT session is not ready');
@@ -638,7 +631,10 @@ function createMqttManager(
       qos: 0,
     }));
 
-    const packet = buildSubscribePacket(subscriptions, packetIDCounter++);
+    const packet = buildSubscribePacket(
+      subscriptions,
+      nextPacketID()
+    );
 
     ws.send(packet);
 
@@ -651,12 +647,19 @@ function createMqttManager(
    * Handles a received CONNACK packet.
    *
    * ReturnCode 0: session established — start keepalive, subscribe, fire callback.
-   * ReturnCode 1-5: authentication or protocol rejection — mark authFailure,
+   * ReturnCode 1,2,4,5: permanent authentication/protocol rejections — mark authFailure,
    *   fire error callback, close socket.  Does NOT initiate reconnect.
+   * ReturnCode 3: Server unavailable — temporary, should retry.
+   * Other codes: unknown — log and attempt reconnect.
    *
    * @param {Buffer} buffer
    */
   function handleConnack(buffer) {
+    // Diagnostic: log the raw CONNACK bytes
+    logger.debug(
+      `MQTT CONNACK raw: ${buffer.toString('hex')}`
+    );
+
     const result = parseConnack(buffer);
 
     if (!result.valid) {
@@ -668,16 +671,16 @@ function createMqttManager(
       `MQTT CONNACK: flags=0x${result.flags.toString(16)}, returnCode=${result.returnCode}`
     );
 
+    logger.debug(
+      `MQTT CONNACK parsed: flags=${result.flags}, ` +
+      `returnCode=${result.returnCode}, ` +
+      `rawLength=${buffer.length}`
+    );
+
     clearConnectTimeout();
 
     if (result.returnCode !== 0) {
-      /*
-       * Codes 1-5 are broker-level rejections (protocol, identifier, auth).
-       * None of them will be resolved by reconnecting with the same credentials.
-       * Mark authFailure so the close handler suppresses reconnect.
-       */
       sessionReady = false;
-      authFailure  = true;
 
       const descriptions = {
         1: 'Unacceptable protocol version',
@@ -687,12 +690,32 @@ function createMqttManager(
         5: 'Not authorized',
       };
 
+      /*
+       * Return codes 1, 2, 4, 5 are permanent rejections that won't be resolved
+       * by retrying with the same credentials.
+       *
+       * Return code 3 (Server unavailable) is temporary — reconnect is appropriate.
+       *
+       * Unknown codes (e.g., 21) are treated as unknown; we attempt reconnect
+       * to gather more diagnostic data.
+       */
+      const permanentFailure =
+        result.returnCode === 1 ||
+        result.returnCode === 2 ||
+        result.returnCode === 4 ||
+        result.returnCode === 5;
+
+      if (permanentFailure) {
+        authFailure = true;
+      }
+
       const description =
         descriptions[result.returnCode] ||
-        `Unknown error (code ${result.returnCode})`;
+        `Non-standard broker return code ${result.returnCode}`;
 
       const error = new Error(
-        `MQTT CONNECT rejected by broker: ${description} (return code ${result.returnCode})`
+        `MQTT CONNECT rejected by broker: ${description} ` +
+        `(return code ${result.returnCode})`
       );
 
       logger.error(error.message);
@@ -702,13 +725,14 @@ function createMqttManager(
       }
 
       /*
-       * Close the WebSocket cleanly.  The close handler will see authFailure=true
-       * and will not attempt to reconnect.
+       * Close the WebSocket cleanly.  Use normal close code 1000 with a
+       * descriptive reason.  The close handler will check authFailure to
+       * decide whether to reconnect.
        */
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
           ws.close(
-            MQTT_HANDSHAKE_CLOSE_CODE,
+            MQTT_CLOSE_CODE_NORMAL,
             `MQTT return code ${result.returnCode}`
           );
         } catch {
@@ -902,7 +926,7 @@ function createMqttManager(
    * Creates the WebSocket connection to the Messenger MQTT broker.
    *
    * Cookies are serialised from the session and sent as the Cookie header.
-   * The WebSocket origin and referer headers are set to messenger.com.
+   * The WebSocket origin and referer headers are set to facebook.com.
    *
    * @param {number} sessionNumber - Random large integer for ?sid= and username `s`.
    * @param {string} clientGUID   - UUID for ?cid= and username `d`.
@@ -931,26 +955,34 @@ function createMqttManager(
     logger.info('Connecting to Facebook MQTT broker…');
     logger.debug(`MQTT endpoint: ${MQTT_HOST}?region=pnb&sid=...&cid=...`);
 
+    // Diagnostic: DNS lookup before WebSocket creation
+    const hostname = new URL(MQTT_HOST).hostname;
+    dns.lookup(hostname, (err, address, family) => {
+      if (err) {
+        logger.error(`DNS lookup failed for ${hostname}: ${err.message}`);
+      } else {
+        logger.debug(`DNS resolved ${hostname} -> ${address} (IPv${family})`);
+      }
+    });
+
+    logger.debug(`Attempting WebSocket connection to ${mqttUrl}`);
+
     const socket = new WebSocket(mqttUrl, {
       headers: {
-        Cookie:                       cookieString,
-        Origin:                       'https://www.facebook.com',
-        Referer:                      'https://www.facebook.com/',
-        Host:                         'edge-chat.facebook.com',
+        Cookie:          cookieString,
+        Origin:          'https://www.facebook.com',
+        Referer:         'https://www.facebook.com/',
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
           'Chrome/138.0.0.0 Safari/537.36',
-        'Accept-Language':            'en-US,en;q=0.9',
-        'Accept-Encoding':            'gzip, deflate, br',
-        'Cache-Control':              'no-cache',
-        Pragma:                       'no-cache',
-        Connection:                   'Upgrade',
-        Upgrade:                      'websocket',
-        'Sec-WebSocket-Version':      '13',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control':   'no-cache',
+        Pragma:            'no-cache',
+        // Host, Connection, Upgrade, Sec-WebSocket-Version are set by ws
       },
-      handshakeTimeout:    30_000,
-      perMessageDeflate:   false,
+      handshakeTimeout:  30_000,
+      perMessageDeflate: false,
     });
 
     return socket;
@@ -1021,7 +1053,7 @@ function createMqttManager(
       } catch (err) {
         logger.error('Failed to create MQTT CONNECT:', err);
         if (onErrorCallback) onErrorCallback(err);
-        try { socket.close(MQTT_HANDSHAKE_CLOSE_CODE, 'CONNECT build failed'); } catch { /**/ }
+        try { socket.close(MQTT_CLOSE_CODE_NORMAL, 'CONNECT build failed'); } catch { /**/ }
         return;
       }
 
@@ -1052,7 +1084,7 @@ function createMqttManager(
             'MQTT CONNACK timeout; broker did not acknowledge CONNECT'
           );
           try {
-            socket.close(MQTT_HANDSHAKE_CLOSE_CODE, 'CONNACK timeout');
+            socket.close(MQTT_CLOSE_CODE_NORMAL, 'CONNACK timeout');
           } catch { /**/ }
         }
       }, MQTT_CONNECT_TIMEOUT);
@@ -1072,7 +1104,12 @@ function createMqttManager(
     // ── WebSocket: close ──────────────────────────────────────────────────────
 
     socket.on('close', async (code, reason) => {
-      if (ws === socket) ws = null;
+      // ✅ Fixed: check if this socket is still the active one
+      if (ws !== socket) {
+        return;
+      }
+
+      ws = null;
 
       clearConnectTimeout();
       stopPing();
@@ -1101,7 +1138,7 @@ function createMqttManager(
        * Suppress reconnect in three cases:
        *
        *   intentionallyClosed — caller called disconnect()
-       *   authFailure         — broker rejected CONNECT with code 1-5;
+       *   authFailure         — broker rejected CONNECT with code 1,2,4,5;
        *                          reconnecting with the same credentials is useless
        *   maxReconnectAttempts exhausted — give up and report error
        */
@@ -1115,7 +1152,7 @@ function createMqttManager(
          * do not fire it again here.
          */
         logger.error(
-          'MQTT authentication rejected by broker — not reconnecting'
+          'MQTT authentication permanently rejected by broker — not reconnecting'
         );
         return;
       }
@@ -1193,7 +1230,7 @@ function createMqttManager(
           socket.readyState === WebSocket.OPEN ||
           socket.readyState === WebSocket.CONNECTING
         ) {
-          socket.close(1000, 'Client disconnect');
+          socket.close(MQTT_CLOSE_CODE_NORMAL, 'Client disconnect');
         }
       } catch { /**/ }
     }
@@ -1234,6 +1271,5 @@ module.exports = {
   _buildSubscribePacket:  buildSubscribePacket,
   _buildPingPacket:       buildPingPacket,
   _parseConnack:          parseConnack,
-  _decodeCookieValue:     decodeCookieValue,
   _MQTT_CONNECT_FLAGS:    MQTT_CONNECT_FLAGS,
 };
