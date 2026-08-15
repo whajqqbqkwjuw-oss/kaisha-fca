@@ -60,7 +60,7 @@ const PINGREQ_PACKET_TYPE   = 0xC0;
  * IMPORTANT: 0x42 (former value) sets Password flag (0x40) + Clean Session —
  * this is wrong and causes the Messenger broker to return CONNACK code 5.
  */
-const MQTT_CONNECT_FLAGS = 0x82;  // Username + Clean Session
+const MQTT_CONNECT_FLAGS = 0xC2;  // Username + Clean Session
 
 const DEFAULT_TOPICS = [
   '/legacy_web',
@@ -301,12 +301,12 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
     d:             clientGUID,
     ct:            'websocket',
 
-    mqtt_sid:      '',
+    mqtt_sid:      sessionNumber,
 
     aid:           '219994525426954',
-    aids:          null,
+    aids:          [],
 
-    st:            [],   // Topics are subscribed separately after CONNACK
+    st:            DEFAULT_TOPICS,   // Topics are subscribed separately after CONNACK
 
     pm:            [],
 
@@ -355,6 +355,7 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
   const payload = Buffer.concat([
     encodeMqttString('mqttwsclient'),
     encodeMqttString(username),
+    encodeMqttString(''),
   ]);
 
   const body = Buffer.concat([variableHeader, payload]);
