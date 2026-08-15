@@ -10,7 +10,7 @@
  *
  * MQTT protocol: 3.1 (MQIsdp / protocol level 3)
  * Transport: WebSocket (wss) via the ws package
- * Endpoint: wss://edge-chat.messenger.com/chat
+ * Endpoint: wss://edge-chat.facebook.com/chat
  *
  * Connect flags used: 0x82
  *   Bit 7 = Username flag (0x80) — authentication JSON is in the username field
@@ -306,7 +306,7 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
     aid:           '219994525426954',
     aids:          null,
 
-    st:            [],   // Topics are subscribed separately after CONNACK
+    st:            DEFAULT_TOPICS,
 
     pm:            [],
 
@@ -331,7 +331,7 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
    *   Protocol name:  "MQIsdp" (6 bytes, length-prefixed = 8 bytes total) — MQTT 3.1
    *   Protocol level: 3 (1 byte) — MQTT 3.1
    *   Connect flags:  0x82 = Username (0x80) + Clean Session (0x02)
-   *   Keepalive:      10 s (2 bytes big-endian)
+   *   Keepalive:      60 s (2 bytes big-endian)
    *
    *   NOTE: MQTT 3.1.1 ("MQTT"/level 4) causes the broker to close the WebSocket
    *   immediately with code=1000 reason="Bye" (no CONNACK at all).
@@ -952,7 +952,7 @@ function createMqttManager(
     const mqttUrl =
       `${MQTT_HOST}?region=pnb&sid=${sessionNumber}&cid=${encodeURIComponent(clientGUID)}`;
 
-    logger.info('Connecting to Messenger MQTT broker…');
+    logger.info('Connecting to Facebook MQTT broker…');
     logger.debug(`MQTT endpoint: ${MQTT_HOST}?region=pnb&sid=...&cid=...`);
 
     // Diagnostic: DNS lookup before WebSocket creation
@@ -972,6 +972,7 @@ function createMqttManager(
         Cookie:          cookieString,
         Origin:          'https://www.messenger.com',
         Referer:         'https://www.messenger.com/',
+        'Host':           new URL(mqttUrl).hostname,
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
