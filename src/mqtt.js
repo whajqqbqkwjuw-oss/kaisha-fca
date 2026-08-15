@@ -317,38 +317,41 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
    *   `aids`, `p`, `php_override` are required by the current broker.
    */
   const username = JSON.stringify({
-    u:             userID,
-    s:             sessionNumber,    // random large int — NOT xs cookie
+  u:             userID,
+  s:             sessionNumber,
+  cp:            3,
+  ecp:           10,
 
-    cp:            3,
-    ecp:           10,
+  chat_on:       true,
+  fg:            false,
 
-    chat_on:       true,
-    fg:            false,
+  d:             clientGUID,
+  ct:            'websocket',
 
-    d:             clientGUID,       // UUID matching ?cid= URL param
-    ct:            'websocket',
+  mqtt_sid:      '',
 
-    mqtt_sid:      '',               // empty string — ST-FCA confirmed
+  aid:           '219994525426954',
+  aids:          null,
 
-    aid:           '219994525426954', // string — broker rejects integer form
-    aids:          null,
+  st:             DEFAULT_TOPICS,
 
-    st:            DEFAULT_TOPICS,
+  pm:             [],
 
-    pm:            [],
+  dc:             '',
+  no_auto_fg:    true,
+  gas:            null,
+  pack:           [],
 
-    dc:            '',
-    no_auto_fg:    true,
+  p:             null,
+  php_override:  '',
 
-    gas:           null,
-    pack:          [],
+  locale:        'en_US',
 
-    p:             null,
-    php_override:  '',
-
-    locale:        'en_US',
-  });
+  a:
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+    'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/138.0.0.0 Safari/537.36',
+});
 
   /*
    * MQTT 3.1 variable header:
