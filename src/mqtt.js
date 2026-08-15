@@ -10,7 +10,7 @@
  *
  * MQTT protocol: 3.1 (MQIsdp / protocol level 3)
  * Transport: WebSocket (wss) via the ws package
- * Endpoint: wss://edge-chat.facebook.com/chat
+ * Endpoint: wss://edge-chat.messenger.com/chat
  *
  * Connect flags used: 0x82
  *   Bit 7 = Username flag (0x80) — authentication JSON is in the username field
@@ -55,9 +55,10 @@ const PINGREQ_PACKET_TYPE   = 0xC0;
  *
  * We use Username (0x80) + Clean Session (0x02) = 0x82.
  * The authentication JSON is placed in the username field of the payload.
- * No MQTT password field is sent.
+ * No password field is sent.
  *
- * Password is not used by this transport.
+ * IMPORTANT: 0x42 (former value) sets Password flag (0x40) + Clean Session —
+ * this is wrong and causes the Messenger broker to return CONNACK code 5.
  */
 const MQTT_CONNECT_FLAGS = 0x82;  // Username + Clean Session
 
@@ -185,7 +186,7 @@ function generateGUID() {
  * Generates a random MQTT session number used as the `s` field in the CONNECT
  * username JSON and as the `?sid=` URL parameter.
  *
- * The session uses: Math.floor(Math.random() * 9007199254740991) + 1
+ * ST-FCA uses: Math.floor(Math.random() * 9007199254740991) + 1
  *
  * @returns {number}
  */
@@ -278,32 +279,47 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
   }
 
   /*
-   * Messenger session username JSON.
+   * Username JSON — verified field-by-field against working ST-FCA.
    *
-   * Authentication/session construction:
+   * ROOT CAUSE FIX:
    *   `s` must be a random large integer (MQTT session number).
    *   Using the xs cookie in `s` caused CONNACK 5 and CONNACK 21 errors.
    *
-   *   `mqtt_sid` must be empty string (current Messenger-compatible session format).
+   *   `mqtt_sid` must be empty string (ST-FCA confirmed).
    *   `aids`, `p`, `php_override` are required by the current broker.
    */
   const username = JSON.stringify({
-    u:         userID,
-    s:         sessionNumber,
-    chat_on:   true,
-    fg:        false,
-    d:         clientGUID,
-    ct:        'websocket',
-    aid:       '219994525426954',
-    mqtt_sid:  '',
-    cp:        3,
-    ecp:       10,
-    st:        [],
-    pm:        [],
-    dc:        '',
-    no_auto_fg: true,
-    gas:       null,
-    pack:      [],
+    u:             userID,
+    s:             sessionNumber,
+
+    cp:            3,
+    ecp:           10,
+
+    chat_on:       true,
+    fg:            false,
+
+    d:             clientGUID,
+    ct:            'websocket',
+
+    mqtt_sid:      '',
+
+    aid:           '219994525426954',
+    aids:          null,
+
+    st:            [],   // Topics are subscribed separately after CONNACK
+
+    pm:            [],
+
+    dc:            '',
+    no_auto_fg:    true,
+    gas:           null,
+    pack:          [],
+
+    p:             null,
+    php_override:  '',
+
+    locale:        'en_US',
+
     a:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
       'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -315,7 +331,7 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
    *   Protocol name:  "MQIsdp" (6 bytes, length-prefixed = 8 bytes total) — MQTT 3.1
    *   Protocol level: 3 (1 byte) — MQTT 3.1
    *   Connect flags:  0x82 = Username (0x80) + Clean Session (0x02)
-   *   Keepalive:      60 s (2 bytes big-endian)
+   *   Keepalive:      10 s (2 bytes big-endian)
    *
    *   NOTE: MQTT 3.1.1 ("MQTT"/level 4) causes the broker to close the WebSocket
    *   immediately with code=1000 reason="Bye" (no CONNACK at all).
@@ -956,7 +972,6 @@ function createMqttManager(
         Cookie:          cookieString,
         Origin:          'https://www.messenger.com',
         Referer:         'https://www.messenger.com/',
-        Host:            new URL(mqttUrl).hostname,
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
           'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -1006,7 +1021,7 @@ function createMqttManager(
      * clientGUID:    UUID format → used as ?cid= URL param AND
      *                the `d` field in the CONNECT username JSON.
      *
-     * Uses a fresh session identifier for each connection attempt.
+     * Verified against ST-FCA (working implementation).
      */
     const sessionNumber = generateSessionNumber();
     const clientGUID    = generateGUID();
