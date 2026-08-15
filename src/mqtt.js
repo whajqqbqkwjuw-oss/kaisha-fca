@@ -30,7 +30,7 @@ const { sleep, randomInt } = require('./utils');
 const MQTT_HOST = 'wss://edge-chat.messenger.com/chat';
 
 const MQTT_KEEPALIVE         = 10;
-const MQTT_CONNECT_TIMEOUT   = 20_000;
+const MQTT_CONNECT_TIMEOUT   = 30_000;
 const MQTT_CLOSE_CODE_NORMAL = 1000;  // Normal closure
 
 /*
@@ -285,28 +285,28 @@ function buildConnectPacket(session, sessionNumber, clientGUID) {
    *   Using the xs cookie in `s` caused CONNACK 5 and CONNACK 21 errors.
    *
    *   `mqtt_sid` must be empty string (current Messenger-compatible session format).
-   *   `aids`, `p`, and `php_override` are included for Messenger's current web-session CONNECT format.
+   *   The username intentionally stays limited to the established Messenger web fields.
    */
+  // Keep the CONNECT username to the field set used by the
+  // Messenger web MQTT client.  Do not add speculative fields here:
+  // Facebook's broker is strict about this payload.
   const username = JSON.stringify({
-    u:         userID,
-    s:         sessionNumber,
-    chat_on:   true,
-    fg:        false,
-    d:         clientGUID,
-    ct:        'websocket',
-    aid:       '219994525426954',
-    mqtt_sid:  '',
-    cp:        3,
-    ecp:       10,
-    st:        [],
-    pm:        [],
-    dc:        '',
+    u: userID,
+    s: sessionNumber,
+    chat_on: true,
+    fg: false,
+    d: clientGUID,
+    ct: 'websocket',
+    aid: '219994525426954',
+    mqtt_sid: '',
+    cp: 3,
+    ecp: 10,
+    st: [],
+    pm: [],
+    dc: '',
     no_auto_fg: true,
-    gas:       null,
-    pack:      [],
-    aids:      null,
-    p:          null,
-    php_override: '',
+    gas: null,
+    pack: [],
     a:
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
       'AppleWebKit/537.36 (KHTML, like Gecko) ' +
@@ -496,7 +496,7 @@ function createMqttManager(
 
   let reconnectAttempts = 0;
   let intentionallyClosed = false;
-  let authFailure         = false;  // set on definite auth/protocol rejections (returnCode 1,2,4,5)
+  let authFailure         = false;  // set on definite auth/protocol rejections (returnCode 1,2,4,5,21)
   let sessionReady        = false;
 
   let packetIDCounter = 1;
@@ -690,7 +690,8 @@ function createMqttManager(
         result.returnCode === 1 ||
         result.returnCode === 2 ||
         result.returnCode === 4 ||
-        result.returnCode === 5;
+        result.returnCode === 5 ||
+        result.returnCode === 21;
 
       if (permanentFailure) {
         authFailure = true;
@@ -913,7 +914,7 @@ function createMqttManager(
    * Creates the WebSocket connection to the Messenger MQTT broker.
    *
    * Cookies are serialised from the session and sent as the Cookie header.
-   * The WebSocket origin and referer headers are set to facebook.com.
+   * The WebSocket origin and referer headers are set to messenger.com.
    *
    * @param {number} sessionNumber - Random large integer for ?sid= and username `s`.
    * @param {string} clientGUID   - UUID for ?cid= and username `d`.
@@ -971,6 +972,8 @@ function createMqttManager(
       },
       handshakeTimeout:  30_000,
       perMessageDeflate: false,
+      protocolVersion: 13,
+      origin: 'https://www.messenger.com',
     });
 
     return socket;
@@ -1046,6 +1049,7 @@ function createMqttManager(
       }
 
       logger.info(`MQTT CONNECT packet created (${packet.length} bytes)`);
+      logger.debug(`MQTT CONNECT header: ${packet.subarray(0, Math.min(packet.length, 32)).toString('hex')}`);
 
       try {
         socket.send(packet);
